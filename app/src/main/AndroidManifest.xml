@@ -101,6 +101,20 @@
         </service>
 
         <!--
+            Image-adjust preview screen launched after the user picks
+            a new floating-ball image. The activity is a top-level
+            window so the user sees the image at full size and the
+            "what you see is what you get" circular preview is
+            unambiguous. The result Intent carries the picked URI and
+            the (scale, offsetX, offsetY) the user picked, which
+            HomeScreen forwards to BallService.setBallImage.
+        -->
+        <activity
+            android:name=".ball.BallImageAdjustActivity"
+            android:exported="false"
+            android:theme="@style/Theme.PinPin" />
+
+        <!--
             Accessibility service that owns the screen-capture path.
             We use AccessibilityService.takeScreenshot() (Android 11+ /
             API 30) to grab the screen — this is the trick fooView (FV

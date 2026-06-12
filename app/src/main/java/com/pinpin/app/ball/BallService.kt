@@ -123,8 +123,14 @@ class BallService : Service() {
                     intent.getParcelableExtra(EXTRA_BALL_IMAGE_URI) as? Uri
                 }
                 if (uri != null) {
-                    Log.d(TAG, "SET_BALL_IMAGE received: $uri")
-                    applyBallImage(uri, persist = true)
+                    val scale = intent.getFloatExtra(EXTRA_BALL_IMAGE_SCALE, 1f)
+                    val offsetX = intent.getFloatExtra(EXTRA_BALL_IMAGE_OFFSET_X, 0f)
+                    val offsetY = intent.getFloatExtra(EXTRA_BALL_IMAGE_OFFSET_Y, 0f)
+                    Log.d(
+                        TAG,
+                        "SET_BALL_IMAGE received: $uri scale=$scale offsetX=$offsetX offsetY=$offsetY",
+                    )
+                    applyBallImage(uri, scale, offsetX, offsetY, persist = true)
                 }
             }
             ACTION_CLEAR_BALL_IMAGE -> {
@@ -199,6 +205,17 @@ class BallService : Service() {
             // person doesn't reintroduce it.
             overlayView?.onTouchEvent(event)
         }
+        // Quick tap on the ball (down + up before the
+        // 1.5s arm timer fires) launches the host app so the
+        // user has a way to get back to the home screen from
+        // the floating ball without having to long-press for
+        // the screenshot gesture. The long-press / arm-then-
+        // drag flow is unchanged; this only fires when the
+        // finger lifts without ever arming.
+        ballView.onTap = {
+            Log.d(TAG, "ball tapped — launching host app")
+            openHostApp()
+        }
         runCatching { windowManager.addView(ballView, lp) }
             .onSuccess {
                 ballAttached = true
@@ -218,17 +235,25 @@ class BallService : Service() {
      */
     private fun restoreBallImage() {
         val uri = readBallImagePref() ?: return
-        Log.d(TAG, "restoring saved ball image: $uri")
-        applyBallImage(uri, persist = false)
+        val (scale, offsetX, offsetY) = readBallImageTransformPref()
+        Log.d(TAG, "restoring saved ball image: $uri scale=$scale")
+        applyBallImage(uri, scale, offsetX, offsetY, persist = false)
     }
 
     /**
      * Hand [uri] to the ball view for rendering. If [persist] is true,
      * also take a long-term read permission on the URI (required for
      * content URIs returned by SAF / the photo picker) and write the
-     * URI to SharedPreferences so it survives process death.
+     * URI + the user-chosen [scale] / [offsetX] / [offsetY] to
+     * SharedPreferences so it survives process death.
      */
-    private fun applyBallImage(uri: Uri, persist: Boolean) {
+    private fun applyBallImage(
+        uri: Uri,
+        scale: Float = 1f,
+        offsetX: Float = 0f,
+        offsetY: Float = 0f,
+        persist: Boolean,
+    ) {
         if (persist) {
             // Some sources (e.g. a freshly granted content URI from
             // the photo picker) already give us a long-term grant
@@ -241,21 +266,46 @@ class BallService : Service() {
                     Intent.FLAG_GRANT_READ_URI_PERMISSION,
                 )
             }.onFailure { Log.w(TAG, "takePersistableUriPermission failed for $uri", it) }
-            writeBallImagePref(uri)
+            writeBallImagePref(uri, scale, offsetX, offsetY)
         }
         if (ballAttached) {
             ballView.setBallImageUri(uri)
+            // setBallImageUri kicks off an async decode; we apply
+            // the transform after that completes by re-issuing
+            // it here. [BallView] will ignore the call until the
+            // bitmap is ready, then re-apply on the next draw. To
+            // keep things simple we just call both back-to-back and
+            // let setAvatarTransform re-trigger a redraw.
+            ballView.setAvatarTransform(scale, offsetX, offsetY)
         }
     }
 
     private fun ballPrefs() = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private fun readBallImagePref(): Uri? =
         ballPrefs().getString(KEY_BALL_IMAGE_URI, null)?.let(Uri::parse)
-    private fun writeBallImagePref(uri: Uri) {
-        ballPrefs().edit().putString(KEY_BALL_IMAGE_URI, uri.toString()).apply()
+    private fun writeBallImagePref(uri: Uri, scale: Float, offsetX: Float, offsetY: Float) {
+        ballPrefs().edit()
+            .putString(KEY_BALL_IMAGE_URI, uri.toString())
+            .putFloat(KEY_BALL_IMAGE_SCALE, scale)
+            .putFloat(KEY_BALL_IMAGE_OFFSET_X, offsetX)
+            .putFloat(KEY_BALL_IMAGE_OFFSET_Y, offsetY)
+            .apply()
+    }
+    private fun readBallImageTransformPref(): Triple<Float, Float, Float> {
+        val prefs = ballPrefs()
+        return Triple(
+            prefs.getFloat(KEY_BALL_IMAGE_SCALE, 1f),
+            prefs.getFloat(KEY_BALL_IMAGE_OFFSET_X, 0f),
+            prefs.getFloat(KEY_BALL_IMAGE_OFFSET_Y, 0f),
+        )
     }
     private fun clearBallImagePref() {
-        ballPrefs().edit().remove(KEY_BALL_IMAGE_URI).apply()
+        ballPrefs().edit()
+            .remove(KEY_BALL_IMAGE_URI)
+            .remove(KEY_BALL_IMAGE_SCALE)
+            .remove(KEY_BALL_IMAGE_OFFSET_X)
+            .remove(KEY_BALL_IMAGE_OFFSET_Y)
+            .apply()
     }
 
     private fun attachOverlay(originX: Int, originY: Int) {
@@ -343,6 +393,18 @@ class BallService : Service() {
         // takeScreenshot() itself, crops to the user's selection
         // rect, writes the cache, and inserts the pin.
         Log.d(TAG, "runCapture broadcasting CAPTURE_SCREENSHOT with rect=$rect")
+
+        // Snapshot the pin count BEFORE the broadcast. We use this
+        // 2 seconds later to detect the case where the broadcast
+        // was silently dropped — most commonly because the a11y
+        // service process has been killed (system marks it
+        // "Crashed" after that and won't deliver any further
+        // broadcasts until the user re-enables it from Settings →
+        // Accessibility). Without this check, the user's selection
+        // gesture simply disappears into the void and they get
+        // no feedback that something went wrong.
+        val pinCountBefore = pinRepository.pinsState.value.size
+
         captureHandler.post {
             val intent = android.content.Intent(
                 PinAccessibilityService.ACTION_CAPTURE_SCREENSHOT,
@@ -355,6 +417,54 @@ class BallService : Service() {
             }
             sendBroadcast(intent)
         }
+
+        // After a generous delay, verify the a11y service actually
+        // received the broadcast and inserted a new pin. If not,
+        // surface an actionable Toast so the user knows to
+        // re-enable the a11y service in Settings (the most common
+        // reason a previously-working capture stops is the system
+        // killing the a11y service process for memory pressure).
+        captureHandler.postDelayed({
+            val pinCountAfter = pinRepository.pinsState.value.size
+            if (pinCountAfter <= pinCountBefore) {
+                Log.w(
+                    TAG,
+                    "runCapture: a11y service did not respond within 2s " +
+                        "(pin count unchanged at $pinCountBefore). " +
+                        "The a11y service process is likely killed — " +
+                        "ask the user to re-enable it in Settings.",
+                )
+                android.widget.Toast.makeText(
+                    this,
+                    "无障碍服务未响应。请到 设置 → 辅助功能 → 钉图，关闭再打开一次以恢复截图功能",
+                    android.widget.Toast.LENGTH_LONG,
+                ).show()
+            }
+        }, 2000L)
+    }
+
+    /**
+     * Bring the host app to the foreground. Used as the
+     * [BallView.onTap] target so a quick tap on the floating
+     * ball opens the home screen for the user.
+     *
+     * We use [Intent.FLAG_ACTIVITY_NEW_TASK] (the service has
+     * no task of its own) plus [Intent.FLAG_ACTIVITY_CLEAR_TOP]
+     * so if MainActivity is already in the back stack it gets
+     * brought to the front instead of a fresh duplicate being
+     * pushed on top. [Intent.FLAG_ACTIVITY_SINGLE_TOP] also
+     * covers the case where MainActivity is already on top
+     * and the user just tapped through an overlay.
+     */
+    private fun openHostApp() {
+        val launch = android.content.Intent(this, com.pinpin.app.ui.MainActivity::class.java)
+            .addFlags(
+                android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                    or android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    or android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP
+            )
+        runCatching { startActivity(launch) }
+            .onFailure { Log.w(TAG, "openHostApp: startActivity failed", it) }
     }
 
     // region Notification
@@ -441,12 +551,18 @@ class BallService : Service() {
 
         private const val PREFS_NAME = "pinpin_ball"
         private const val KEY_BALL_IMAGE_URI = "ball_image_uri"
+        private const val KEY_BALL_IMAGE_SCALE = "ball_image_scale"
+        private const val KEY_BALL_IMAGE_OFFSET_X = "ball_image_offset_x"
+        private const val KEY_BALL_IMAGE_OFFSET_Y = "ball_image_offset_y"
 
         const val ACTION_STOP = "com.pinpin.app.ball.STOP"
         const val ACTION_HIDE_OVERLAY = "com.pinpin.app.ball.HIDE_OVERLAY"
         const val ACTION_SET_BALL_IMAGE = "com.pinpin.app.ball.SET_BALL_IMAGE"
         const val ACTION_CLEAR_BALL_IMAGE = "com.pinpin.app.ball.CLEAR_BALL_IMAGE"
         const val EXTRA_BALL_IMAGE_URI = "ball_image_uri"
+        const val EXTRA_BALL_IMAGE_SCALE = "ball_image_scale"
+        const val EXTRA_BALL_IMAGE_OFFSET_X = "ball_image_offset_x"
+        const val EXTRA_BALL_IMAGE_OFFSET_Y = "ball_image_offset_y"
 
         fun start(context: Context) {
             val intent = Intent(context, BallService::class.java)
@@ -465,12 +581,27 @@ class BallService : Service() {
          * Set the floating ball's image from a [Uri] (typically a
          * content URI returned by SAF / the photo picker). The URI is
          * persisted in SharedPreferences and the ball picks it up the
-         * next time it is drawn.
+         * next time it is drawn. The optional [scale] / [offsetX] /
+         * [offsetY] describe a user-driven transform layered on top
+         * of the default CENTER_CROP cover; defaults to (1, 0, 0)
+         * which is the legacy "fit cover, no pan" behavior. The
+         * [BallImageAdjustActivity] preview passes the values the
+         * user actually picked so the saved ball matches what they
+         * saw on the preview.
          */
-        fun setBallImage(context: Context, uri: Uri) {
+        fun setBallImage(
+            context: Context,
+            uri: Uri,
+            scale: Float = 1f,
+            offsetX: Float = 0f,
+            offsetY: Float = 0f,
+        ) {
             val intent = Intent(context, BallService::class.java)
                 .setAction(ACTION_SET_BALL_IMAGE)
                 .putExtra(EXTRA_BALL_IMAGE_URI, uri)
+                .putExtra(EXTRA_BALL_IMAGE_SCALE, scale)
+                .putExtra(EXTRA_BALL_IMAGE_OFFSET_X, offsetX)
+                .putExtra(EXTRA_BALL_IMAGE_OFFSET_Y, offsetY)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
             } else {

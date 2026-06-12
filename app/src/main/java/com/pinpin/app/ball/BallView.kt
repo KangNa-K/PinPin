@@ -167,6 +167,15 @@ class BallView @JvmOverloads constructor(
     private var avatarBitmap: Bitmap? = null
     private var avatarShader: BitmapShader? = null
     private val avatarShaderMatrix = Matrix()
+    /**
+     * User-driven transform layered on top of the default CENTER_CROP
+     * cover. See [setAvatarTransform]. `avatarScale` is a multiplier
+     * on the base CENTER_CROP scale (1 = unchanged). The offsets are
+     * in screen pixels and shift the centered image.
+     */
+    private var avatarScale: Float = 1f
+    private var avatarOffsetX: Float = 0f
+    private var avatarOffsetY: Float = 0f
     private val avatarPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     /** Outer ring color for the image case (yellow when armed, white otherwise). */
     private val imageRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -225,6 +234,26 @@ class BallView @JvmOverloads constructor(
             avatarShader = BitmapShader(bitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
         }
         Log.d(TAG, "setBallImageBitmap: ${if (bitmap == null) "null (revert)" else "${bitmap.width}x${bitmap.height}"} — invalidate")
+        invalidate()
+    }
+
+    /**
+     * Apply a user-driven transform on top of the default CENTER_CROP
+     * cover. The default is `scale = 1, offsetX = 0, offsetY = 0`
+     * (which is identical to the previous behavior). `scale > 1`
+     * zooms the avatar in, `scale < 1` zooms out; the offset
+     * shifts the avatar in screen pixels (positive values move
+     * the image right/down so the user can see more of the
+     * top-left corner of the source). Used by the
+     * [com.pinpin.app.ball.BallImageAdjustActivity] preview, which
+     * applies the same values here so what the user adjusts is
+     * what they see on the actual ball.
+     */
+    fun setAvatarTransform(scale: Float, offsetX: Float, offsetY: Float) {
+        val s = if (scale.isFinite() && scale > 0f) scale else 1f
+        avatarScale = s
+        avatarOffsetX = offsetX
+        avatarOffsetY = offsetY
         invalidate()
     }
 
@@ -370,22 +399,37 @@ class BallView @JvmOverloads constructor(
         val shader = avatarShader
         if (shader != null && avatarBitmap != null) {
             // Custom image: scale to cover the ball, clipped to a
-            // circle. We re-compute the matrix on every draw because
-            // the bitmap's intrinsic size is fixed but we may have
-            // been resized (rotation, density change, etc.). Cost is
-            // trivial compared to the shader fill.
+            // circle. The user may have applied an additional
+            // [setAvatarTransform] (zoom/pan) — we compose that
+            // on top of the base CENTER_CROP matrix so what the
+            // user sees in the adjust preview is exactly what
+            // ends up rendered on the ball. The base matrix
+            // already centers the image, so the user's
+            // (scale, offsetX, offsetY) is applied relative to
+            // that center. We re-compute on every draw because the
+            // bitmap's intrinsic size is fixed but we may have
+            // been resized (rotation, density change, etc.).
             val bmp = avatarBitmap!!
             val side = r + ringStrokePx
             val targetDiameter = side * 2f
-            val scale = maxOf(
+            val baseScale = maxOf(
                 targetDiameter / bmp.width,
                 targetDiameter / bmp.height,
             )
+            val finalScale = baseScale * avatarScale
+            val scaledW = bmp.width * finalScale
+            val scaledH = bmp.height * finalScale
             avatarShaderMatrix.reset()
-            avatarShaderMatrix.setScale(scale, scale)
+            avatarShaderMatrix.setScale(finalScale, finalScale)
+            // postTranslate uses the bitmap's top-left in the
+            // scaled coordinate system; we want it centered at
+            // (cx, cy) plus the user-driven offset. Subtracting
+            // half the scaled dimensions yields the centering,
+            // and adding (avatarOffsetX, avatarOffsetY) lets the
+            // user pan the image in pixels.
             avatarShaderMatrix.postTranslate(
-                cx - bmp.width * scale / 2f,
-                cy - bmp.height * scale / 2f,
+                cx - scaledW / 2f + avatarOffsetX,
+                cy - scaledH / 2f + avatarOffsetY,
             )
             shader.setLocalMatrix(avatarShaderMatrix)
             avatarPaint.shader = shader
@@ -408,14 +452,25 @@ class BallView @JvmOverloads constructor(
             return
         }
 
-        // Default rendering — unchanged from the original spec.
-        // Outer ring (white)
+        // Default rendering. The previous design flipped the
+        // core from red to yellow in ARMED state, but on the
+        // small 48dp ball yellow + white ring + red badge
+        // composited into something that reads as muddy/dark.
+        // We keep the core red (that's the ball identity the
+        // user has learned) and instead flip the OUTER ring
+        // to yellow in ARMED — that gives a clear, high-
+        // contrast "red heart inside a yellow ring" signal
+        // for the screenshot-ready state.
+        ringPaint.color = if (state == State.ARMED) {
+            coreArmedPaint.color
+        } else {
+            Color.WHITE
+        }
         ringPaint.strokeWidth = ringStrokePx
         canvas.drawCircle(cx, cy, r + ringStrokePx, ringPaint)
 
-        // Core: red (idle/dragging) or yellow (armed)
-        val paint = if (state == State.ARMED) coreArmedPaint else corePaint
-        canvas.drawCircle(cx, cy, r, paint)
+        // Core: always red — the ball's identity colour.
+        canvas.drawCircle(cx, cy, r, corePaint)
 
         // Tiny crosshair on the ball — visual hint to the user
         // that the ball is the "selector origin". We always draw it
