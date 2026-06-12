@@ -63,6 +63,7 @@
     <string name="pin_action_arrow">箭头</string>
     <string name="pin_action_passthrough">穿透</string>
     <string name="pin_action_lock">锁定</string>
+    <string name="pin_action_minimize">收起</string>
     <string name="pin_action_close">关闭</string>
     <string name="pin_action_save_toast">已保存到相册</string>
     <string name="pin_action_close_cd">关闭钉图</string>

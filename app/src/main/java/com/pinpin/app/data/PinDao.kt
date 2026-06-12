@@ -18,6 +18,21 @@ interface PinDao {
     @Query("SELECT COALESCE(MAX(zOrder), 0) FROM pins")
     suspend fun maxZOrder(): Int
 
+    /** Same as [maxZOrder] but ignores pins that have been
+     *  "un-numbered" (zOrder = 0). Used when assigning the next
+     *  serial number so a pin that opted out of numbering
+     *  doesn't keep eating the #1 slot. */
+    @Query("SELECT COALESCE(MAX(zOrder), 0) FROM pins WHERE zOrder > 0")
+    suspend fun maxPositiveZOrder(): Int
+
+    /** Stream of pin ids in stable display order (numbered
+     *  pins first by zOrder, then unnumbered pins by
+     *  createdAt). Used by the repository's
+     *  [com.pinpin.app.data.PinRepository.renormalizeZOrders]
+     *  loop to figure out which pin should get the next slot. */
+    @Query("SELECT id FROM pins ORDER BY CASE WHEN zOrder > 0 THEN 0 ELSE 1 END, zOrder ASC, createdAt ASC")
+    suspend fun idsInDisplayOrder(): List<String>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(pin: PinEntity)
 

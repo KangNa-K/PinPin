@@ -6,6 +6,8 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
 import android.view.MotionEvent
 import android.view.View
 import kotlin.math.atan2
@@ -79,6 +81,26 @@ class DrawingOverlayView(context: Context) : View(context) {
     private val arrowStart = floatArrayOf(0f, 0f)
     private var arrowDragging = false
 
+    /**
+     * Reusable xfermode for the eraser. The CLEAR xfermode turns
+     * a paint stroke into a "subtract" operation — pixels under
+     * the stroke become transparent, which is exactly the visual
+     * we want from a rubber eraser (existing pen strokes vanish,
+     * the original image shows through). We need a software
+     * layer ([setLayerType(LAYER_TYPE_SOFTWARE)]) for xfermodes
+     * to behave consistently across devices; see [init].
+     */
+    private val clearXfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
+
+    init {
+        // PorterDuff.Mode.CLEAR on hardware-accelerated views is
+        // unreliable on older devices; pin the whole overlay to a
+        // software layer. The drawing surface is at most a phone
+        // screen's worth of pixels, so the perf hit is negligible
+        // for this UX.
+        setLayerType(LAYER_TYPE_SOFTWARE, null)
+    }
+
     /** Remove the last committed stroke (undo). */
     fun undo() {
         if (strokes.isNotEmpty()) {
@@ -110,7 +132,12 @@ class DrawingOverlayView(context: Context) : View(context) {
         val h = height.coerceAtLeast(1)
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
-        drawStrokes(canvas)
+        // Two-pass render so eraser strokes apply AFTER pen
+        // strokes (same logic as onDraw) — otherwise a
+        // previously-drawn eraser would visually undo strokes
+        // added after it in the export bitmap.
+        drawNonEraserStrokes(canvas)
+        drawEraserStrokes(canvas)
         return bmp
     }
 
@@ -218,32 +245,89 @@ class DrawingOverlayView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        drawStrokes(canvas)
+        // Two-pass drawing: first lay down all PEN / ARROW
+        // strokes (they use normal paint blending), then apply
+        // the ERASER strokes on top with CLEAR blending. CLEAR
+        // subtracts pixels from the canvas wherever the eraser
+        // path touches them — so existing pen strokes vanish
+        // and the underlying image shows through, instead of
+        // the previous behavior where the eraser painted a thick
+        // white stroke on top of everything.
+        drawNonEraserStrokes(canvas)
+        drawEraserStrokes(canvas)
+        // Preview of the in-progress gesture
         if (currentPoints.size >= 2) {
-            val previewColor = if (mode == Mode.ERASER) eraserColor else strokeColor
-            drawFreehandStroke(canvas, currentPoints, previewColor, brushStyle, strokeWidth)
-        }
-    }
-
-    private fun drawStrokes(canvas: Canvas) {
-        for (stroke in strokes) {
-            when (stroke.mode) {
-                Mode.PEN, Mode.ERASER -> drawFreehandStroke(
+            if (mode == Mode.ERASER) {
+                strokePaint.xfermode = clearXfermode
+                strokePaint.color = Color.BLACK
+                drawFreehandStrokeInternal(
                     canvas,
-                    stroke.points,
-                    stroke.color,
-                    stroke.brushStyle,
-                    stroke.baseWidth,
+                    currentPoints,
+                    brushStyle,
+                    strokeWidth,
                 )
-                Mode.ARROW -> drawArrowStroke(canvas, stroke)
+                strokePaint.xfermode = null
+            } else {
+                drawFreehandStrokeInternal(
+                    canvas,
+                    currentPoints,
+                    brushStyle,
+                    strokeWidth,
+                )
             }
         }
     }
 
-    private fun drawFreehandStroke(
+    private fun drawNonEraserStrokes(canvas: Canvas) {
+        for (stroke in strokes) {
+            when (stroke.mode) {
+                Mode.PEN -> {
+                    strokePaint.xfermode = null
+                    strokePaint.color = stroke.color
+                    drawFreehandStrokeInternal(
+                        canvas,
+                        stroke.points,
+                        stroke.brushStyle,
+                        stroke.baseWidth,
+                    )
+                }
+                Mode.ARROW -> drawArrowStroke(canvas, stroke)
+                Mode.ERASER -> { /* drawn in second pass */ }
+            }
+        }
+    }
+
+    private fun drawEraserStrokes(canvas: Canvas) {
+        for (stroke in strokes) {
+            if (stroke.mode == Mode.ERASER) {
+                strokePaint.xfermode = clearXfermode
+                // Color is irrelevant under CLEAR xfermode (the
+                // pixel is forced to 0); we just pick black for
+                // // safety.
+                strokePaint.color = Color.BLACK
+                drawFreehandStrokeInternal(
+                    canvas,
+                    stroke.points,
+                    stroke.brushStyle,
+                    stroke.baseWidth,
+                )
+                strokePaint.xfermode = null
+            }
+        }
+    }
+
+    /**
+     * Render a freehand stroke to [canvas]. The stroke color and
+     * alpha are read from [strokePaint]; callers (the
+     * non-eraser pass and the eraser pass) are responsible for
+     * setting `strokePaint.color` / `strokePaint.xfermode` before
+     * invoking this. Splitting color setup from geometry drawing
+     * lets the eraser pass use [clearXfermode] without having to
+     * duplicate the path / width / pressure code below.
+     */
+    private fun drawFreehandStrokeInternal(
         canvas: Canvas,
         points: List<Point>,
-        color: Int,
         style: BrushStyle,
         baseWidth: Float,
     ) {
@@ -268,7 +352,15 @@ class DrawingOverlayView(context: Context) : View(context) {
             BrushStyle.PEN -> 255
         }
         val alpha = (baseAlpha + avgPressure * 80f).toInt().coerceAtMost(255)
-        strokePaint.color = color
+        // Don't override an active xfermode (CLEAR) or color
+        // (black) when the eraser pass set them. Only stamp
+        // alpha + width; the caller controls color / blending.
+        if (strokePaint.xfermode == null) {
+            // Pen pass: alpha is meaningful. The color is set
+            // by the caller in drawNonEraserStrokes — but to
+            // keep this helper self-contained for the preview
+            // case, we still set alpha here.
+        }
         strokePaint.alpha = alpha
         strokePaint.strokeWidth = width
         canvas.drawPath(path, strokePaint)

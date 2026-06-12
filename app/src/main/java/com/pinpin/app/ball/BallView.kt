@@ -11,6 +11,7 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Shader
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -96,6 +97,30 @@ class BallView @JvmOverloads constructor(
      */
     private var armRedirect: ((MotionEvent) -> Unit)? = null
     fun setArmRedirect(r: ((MotionEvent) -> Unit)?) { armRedirect = r }
+
+    /**
+     * Optional tap callback. When the user releases the ball
+     * without dragging, the ball normally snaps back to the
+     * screen edge. If [onTap] is non-null, the callback fires
+     * INSTEAD of the snap-back — used by the "minimized pin"
+     * flow, where a tap on the ball should restore the full
+     * pin window rather than just re-anchoring the ball.
+     *
+     * IMPORTANT: this only fires on a true tap (no significant
+     * movement before release). A drag-and-release still snaps
+     * back so the ball can be repositioned as usual.
+     */
+    var onTap: (() -> Unit)? = null
+
+    /**
+     * Optional serial-number badge. When non-null, the ball
+     * draws a small red circle with the number in the
+     * top-right corner. Used by the "minimized pin" flow so
+     * the user can still see which pin the ball stands in
+     * for (mirroring the serial badge on the original pin).
+     * Set to `null` to hide.
+     */
+    var zOrderBadge: Int? = null
 
     private val windowManager: WindowManager =
         context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -376,6 +401,10 @@ class BallView @JvmOverloads constructor(
                 Color.WHITE
             }
             canvas.drawCircle(cx, cy, side, imageRingPaint)
+            // Also overlay the zOrder badge so the user can tell
+            // which pin this ball represents. The badge is drawn
+            // AFTER the ring so it sits on top of the avatar.
+            drawZOrderBadge(canvas)
             return
         }
 
@@ -395,6 +424,51 @@ class BallView @JvmOverloads constructor(
         val ch = r * 0.35f
         canvas.drawLine(cx - ch, cy, cx + ch, cy, crosshairPaint)
         canvas.drawLine(cx, cy - ch, cx, cy + ch, crosshairPaint)
+
+        // Serial-number badge overlay — only drawn for the
+        // default style (the custom-image path returns early
+        // above). Mirrors the badge on the original pin
+        // so the user can still see which pin this ball
+        // represents when the image is collapsed.
+        drawZOrderBadge(canvas)
+    }
+
+    private val badgeFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.parseColor("#E53935") // M3 error red
+    }
+    private val badgeStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = Color.WHITE
+        strokeWidth = dp(1.5f)
+    }
+    private val badgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+    }
+
+    private fun drawZOrderBadge(canvas: Canvas) {
+        val n = zOrderBadge ?: return
+        // Match the on-pin badge: 18dp diameter circle pinned
+        // to the top-right corner, with a thin white ring to
+        // separate it from the avatar.
+        val badgeRadius = dp(9f)
+        val cx = width - badgeRadius - dp(1f)
+        val cy = badgeRadius + dp(1f)
+        canvas.drawCircle(cx, cy, badgeRadius, badgeFillPaint)
+        canvas.drawCircle(cx, cy, badgeRadius, badgeStrokePaint)
+        // Number — sized to fit. 2–3 digit numbers use a
+        // slightly smaller font so the digit stays inside the
+        // ring.
+        val text = n.toString()
+        badgeTextPaint.textSize = if (text.length <= 1) dp(11f) else dp(9f)
+        // Vertically center the glyph baseline on the badge
+        // center; Paint.FontMetrics gives the offset from the
+        // baseline to the visual top of the text.
+        val fm = badgeTextPaint.fontMetrics
+        val baseline = cy - (fm.ascent + fm.descent) / 2f
+        canvas.drawText(text, cx, baseline, badgeTextPaint)
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -460,11 +534,29 @@ class BallView @JvmOverloads constructor(
                 handler.removeCallbacks(armRunnable)
                 when (state) {
                     State.DRAGGING -> {
-                        // Released without ever arming: this is a "tap
-                        // on the ball" — for v0.5 we just snap back to
-                        // the edge and ignore. A future iteration could
-                        // open the HomeScreen here.
-                        Log.d(TAG, "ACTION_UP from DRAGGING: tap on ball, no arm — snapping back")
+                        // Released without ever arming. Two cases:
+                        //   1. The ball wasn't dragged (hasDragged ==
+                        //      false): this is a real "tap on the
+                        //      ball". If a tap callback is wired up
+                        //      (minimized-pin flow), fire it.
+                        //   2. The ball was dragged: snap back to
+                        //      the edge as before.
+                        if (!hasDragged) {
+                            val tap = onTap
+                            if (tap != null) {
+                                Log.d(TAG, "ACTION_UP from DRAGGING: tap on ball — firing onTap")
+                                tap.invoke()
+                                // Don't snap back — the host
+                                // (PinOverlayService) is about to
+                                // tear the ball down and re-attach
+                                // the full pin. Skipping snap-back
+                                // avoids a one-frame visual jolt.
+                                state = State.IDLE
+                                invalidate()
+                                return true
+                            }
+                        }
+                        Log.d(TAG, "ACTION_UP from DRAGGING: snap back")
                         snapToEdge(lp)
                     }
                     State.ARMED -> {

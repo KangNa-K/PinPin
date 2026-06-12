@@ -87,7 +87,12 @@ class PinRepository @Inject constructor(
         defaultWidthPx: Int,
         defaultHeightPx: Int,
     ) {
-        val newZ = dao.maxZOrder() + 1
+        // Only count pins that are currently numbered. A pin
+        // that has been "un-numbered" (zOrder = 0) doesn't keep
+        // occupying a slot — when the user re-enables its
+        // badge, it should get a fresh, high zOrder, not the
+        // old one it vacated.
+        val newZ = dao.maxPositiveZOrder() + 1
         val density = context.resources.displayMetrics.density
         val maxW = (480 * density).toInt()
         val maxH = (480 * density).toInt()
@@ -116,6 +121,11 @@ class PinRepository @Inject constructor(
 
     suspend fun removePin(id: String) {
         dao.deleteById(id)
+        // The remaining numbered pins must renumber so the
+        // sequence stays 1, 2, 3, ... without gaps. Without
+        // this, deleting pin #1 leaves #2, #3, … and the
+        // user sees a confusingly numbered set.
+        renormalizeZOrders()
     }
 
     suspend fun updatePosition(id: String, x: Int, y: Int) {
@@ -135,9 +145,54 @@ class PinRepository @Inject constructor(
     }
 
     suspend fun bringToFront(id: String) {
-        val top = dao.maxZOrder() + 1
+        // Bump above any numbered pin; unnumbered pins
+        // (zOrder = 0) don't compete for the top slot.
+        val top = dao.maxPositiveZOrder() + 1
         dao.updateZOrder(id, top)
     }
+
+    /**
+     * Renumber the pin set so the visible badges read 1, 2, 3,
+     * ... without gaps. The numbering follows the existing
+     * display order — numbered pins (zOrder > 0) keep their
+     * relative order, then unnumbered pins (zOrder = 0) are
+     * appended at the end in createdAt order. This is called
+     * after any operation that leaves a gap in the sequence:
+     * a pin deletion, a pin being un-numbered, etc.
+     *
+     * Pins that already have the correct zOrder are skipped
+     * to keep the Room invalidation log quiet and avoid
+     * redundant [applyPinList] rebuilds.
+     */
+    suspend fun renormalizeZOrders() {
+        val ids = dao.idsInDisplayOrder()
+        ids.forEachIndexed { index, id ->
+            val newZ = index + 1
+            // [idsInDisplayOrder] already starts with
+            // numbered pins in zOrder order, so the first
+            // pin in the list SHOULD be 1. The case where it
+            // doesn't is when there are no numbered pins —
+            // we still need to renumber from 1 because the
+            // user has opted to start a new sequence.
+            if (dao.findById(id)?.zOrder != newZ) {
+                dao.updateZOrder(id, newZ)
+            }
+        }
+    }
+
+    /**
+     * The next free positive slot in the numbered sequence.
+     * Equal to `MAX(zOrder > 0) + 1`, or 1 if no pin is
+     * currently numbered. Callers that turn a previously
+     * un-numbered pin back on should use this as the
+     * pin's new zOrder before invoking [renormalizeZOrders].
+     */
+    suspend fun nextAvailableZOrder(): Int = dao.maxPositiveZOrder() + 1
+
+    /** Read the current zOrder of a single pin. Used after a
+     *  renumber to stamp the badge with the post-shuffle
+     *  value. Returns `null` if the pin no longer exists. */
+    suspend fun findZOrder(id: String): Int? = dao.findById(id)?.zOrder
 
     /**
      * Bump the rotation by 90° clockwise. Persists the new value

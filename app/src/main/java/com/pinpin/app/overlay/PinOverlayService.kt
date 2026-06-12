@@ -15,6 +15,7 @@ import android.graphics.PixelFormat
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
+import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Gravity
 import android.view.WindowManager
@@ -92,6 +93,19 @@ class PinOverlayService : Service() {
      * the main window has FLAG_NOT_TOUCHABLE.
      */
     private val passthroughButtons = ConcurrentHashMap<String, ImageView>()
+
+    /**
+     * Floating balls that stand in for "minimized" pins. When
+     * the user taps the new "收起" toolbar action on a pin,
+     * [minimizePin] removes the [PinWindowView] from the
+     * WindowManager and replaces it with a [BallView] that
+     * shows the pin's image. Tapping the ball restores the
+     * full pin via [restorePin]. The ball is a top-level
+     * WindowManager window (not a child of the pin view) so
+     * the user can keep dragging / re-anchoring it on the
+     * screen edge while the underlying pin is detached.
+     */
+    private val minimizedBalls = ConcurrentHashMap<String, android.view.View>()
 
     /**
      * Pin ids whose views are currently detached because of a temporary
@@ -210,6 +224,8 @@ class PinOverlayService : Service() {
     override fun onDestroy() {
         passthroughButtons.values.forEach { runCatching { windowManager.removeView(it) } }
         passthroughButtons.clear()
+        minimizedBalls.values.forEach { runCatching { windowManager.removeView(it) } }
+        minimizedBalls.clear()
         activePins.values.forEach { runCatching { windowManager.removeView(it) } }
         activePins.clear()
         scope.cancel()
@@ -253,6 +269,14 @@ class PinOverlayService : Service() {
                 ) {
                     existing.updateSizeFromExternal(entity.width.toInt(), entity.height.toInt())
                 }
+                // Sync the live badge after a renumber. Fires
+                // when another pin was deleted or un-numbered
+                // and the repository re-allocated zOrders. The
+                // on-screen red badge (if shown) and the next
+                // minimized-ball badge are both kept in step.
+                if (entity.zOrder != 0) {
+                    existing.updateZOrder(entity.zOrder)
+                }
             }
         }
 
@@ -270,6 +294,13 @@ class PinOverlayService : Service() {
             widthPx = entity.width.toInt(),
             heightPx = entity.height.toInt(),
             locked = entity.locked,
+            // Surface the pin's display order so the "收起"
+            // toolbar action can show a numeric badge — the
+            // user can tell at a glance which pin the
+            // minimize button belongs to, the same number
+            // they will then see on the floating ball that
+            // takes its place.
+            zOrder = entity.zOrder,
         )
         // [PinWindowView] references itself in the onActionClicked
         // callback (used to apply rotation/flip/passthrough on the
@@ -396,14 +427,49 @@ class PinOverlayService : Service() {
                 // window.
                 view.setPassthrough(!view.isPassthrough())
             }
+            PinWindowView.ACTION_MINIMIZE -> {
+                // "Minimize to ball" — tear down the pin window
+                // and stand up a floating ball in its place. The
+                // user can re-attach the full pin by tapping the
+                // ball. State (position / size / rotation) is
+                // already persisted in Room by the pin view's
+                // own callbacks, so [restorePin] simply re-issues
+                // the same entity through [attachNew].
+                minimizePin(entity)
+            }
             PinWindowView.ACTION_SERIAL -> {
                 // Toggle a serial number badge on the image.
-                // The number is the pin's zOrder.
-                val badge = view.serialBadge
-                if (badge != null) {
+                // Toggling also drives the zOrder field in
+                // Room so the rest of the pin set renumbers
+                // automatically: turning a badge OFF drops
+                // the pin out of the numbered sequence
+                // (zOrder -> 0, remaining pins shift up),
+                // turning it back ON gives it the next
+                // available slot.
+                if (view.serialBadge != null) {
                     view.removeSerialBadge()
+                    scope.launch {
+                        pinRepository.setZOrder(entity.id, 0)
+                        pinRepository.renormalizeZOrders()
+                    }
                 } else {
-                    view.showSerialBadge(entity.zOrder)
+                    scope.launch {
+                        // Append to the end of the numbered
+                        // sequence; renormalize then takes
+                        // care of any collisions in case the
+                        // pin already had a stale zOrder.
+                        val nextZ = pinRepository.nextAvailableZOrder()
+                        pinRepository.setZOrder(entity.id, nextZ)
+                        pinRepository.renormalizeZOrders()
+                        // showSerialBadge uses the live
+                        // zOrder AFTER the renumber so the
+                        // badge matches the rest of the
+                        // sequence (it may have shifted if
+                        // another pin was deleted in the
+                        // meantime).
+                        val currentZ = pinRepository.findZOrder(entity.id) ?: nextZ
+                        view.showSerialBadge(currentZ)
+                    }
                 }
             }
             PinWindowView.ACTION_ANNOTATE -> {
@@ -571,6 +637,130 @@ class PinOverlayService : Service() {
             }.onFailure { Log.e(TAG, "save failed for ${entity.id}", it) }
         }
     }
+
+    // region Minimize / restore
+
+    /**
+     * Tear down the pin's full window and replace it with a
+     * floating ball that shows the pin's image. The ball
+     * appears at the pin's last known position so the user
+     * sees a continuous "shrinking" gesture.
+     *
+     * The pin's state (x, y, w, h, rotation, locked, etc.)
+     * is already persisted in Room by [PinWindowView]'s
+     * onPositionChanged / onSizeChanged callbacks, so this
+     * method only manipulates the in-memory [activePins] /
+     * [minimizedBalls] maps and the WindowManager. On restore
+     * the pin is rebuilt from the same Room row, so any state
+     * the user changed before minimizing (rotation, lock,
+     * passthrough, etc.) carries over.
+     */
+    private fun minimizePin(entity: PinEntity) {
+        val view = activePins[entity.id] ?: return
+        if (minimizedBalls.containsKey(entity.id)) return
+
+        // 1. Remove the PinWindowView from the WindowManager
+        //    and from [activePins]. The view object is dropped
+        //    here; restoring will rebuild it from Room.
+        runCatching { windowManager.removeView(view) }
+        activePins.remove(entity.id)
+        // 2. Also clear any in-flight "exit passthrough" button
+        //    — restoring will recreate it if needed.
+        removePassthroughButton(entity.id)
+
+        // 3. Build the floating ball that stands in for the
+        //    pin. We use the same BallView class the persistent
+        //    selection ball uses, but the layout parameters are
+        //    tweaked: size is the standard 76dp ball, position
+        //    is centered on the pin's last known (x, y, w, h)
+        //    so the gesture feels like "shrink to a ball" rather
+        //    than "teleport to a corner".
+        val ballView = com.pinpin.app.ball.BallView(this)
+        val density = resources.displayMetrics.density
+        val ballSize = (56 * density).toInt() + (20 * density).toInt() // 76dp hit area
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(metrics)
+        val pinCenterX = entity.x + entity.width.toInt() / 2
+        val pinCenterY = entity.y + entity.height.toInt() / 2
+        val initialX = (pinCenterX - ballSize / 2)
+            .coerceIn(0, (metrics.widthPixels - ballSize).coerceAtLeast(0))
+        val initialY = (pinCenterY - ballSize / 2)
+            .coerceIn(0, (metrics.heightPixels - ballSize).coerceAtLeast(0))
+
+        val lp = WindowManager.LayoutParams(
+            ballSize,
+            ballSize,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = initialX
+            y = initialY
+        }
+        ballView.attachedParams = lp
+        ballView.attachedDisplayWidth = metrics.widthPixels
+        ballView.attachedDisplayHeight = metrics.heightPixels
+        // 4. The ball is "tappable" — tapping it restores the
+        //    pin instead of just snapping back to an edge.
+        ballView.onTap = { restorePin(entity.id) }
+        // 5. Show the pin's image inside the ball so the user
+        //    can see what they're about to restore.
+        val uri = runCatching { android.net.Uri.parse(entity.imageUri) }.getOrNull()
+        if (uri != null) {
+            runCatching { ballView.setBallImageUri(uri) }
+                .onFailure { Log.w(TAG, "minimizePin: setBallImageUri failed for ${entity.id}", it) }
+        }
+        // 6. Forward the serial badge so the user can still see
+        //    the pin's number on the minimized ball (matches the
+        //    red corner badge on the original pin). If the user
+        //    never enabled the badge for this pin, the ball just
+        //    shows the bare avatar.
+        val badgeNumber = view.serialBadgeNumber()
+        ballView.zOrderBadge = badgeNumber
+
+        runCatching { windowManager.addView(ballView, lp) }
+            .onSuccess { minimizedBalls[entity.id] = ballView }
+            .onFailure { Log.e(TAG, "minimizePin: addView(ball) failed for ${entity.id}", it) }
+
+        // The notification count no longer includes this pin
+        // (it's not currently a full window), but the user
+        // might still want a hint that the ball represents a
+        // pin. We refresh the count to activePins.size only.
+        startForegroundCompat(activePins.size)
+    }
+
+    /**
+     * Tap-on-ball handler. Tears down the ball for [pinId] and
+     * re-issues the same Room row through [attachNew], which
+     * rebuilds the full [PinWindowView] at the persisted
+     * position / size. Any state the user set before
+     * minimizing (rotation, lock, etc.) is preserved.
+     */
+    private fun restorePin(pinId: String) {
+        val ball = minimizedBalls.remove(pinId) ?: return
+        runCatching { windowManager.removeView(ball) }
+
+        val entity = pinRepository.pinsState.value.firstOrNull { it.id == pinId }
+        if (entity == null) {
+            // The pin was deleted while minimized — nothing to
+            // restore. Drop the ball view we already removed.
+            Log.w(TAG, "restorePin: $pinId not found in repository")
+            return
+        }
+        // Re-issue the entity through the standard attach path.
+        // [applyPinList] would no-op here because the pin is
+        // already in [activePins] in the repository's view,
+        // but we already removed it from in-memory [activePins]
+        // when we minimized — so we go straight to [attachNew]
+        // to recreate the PinWindowView.
+        attachNew(entity)
+    }
+
+    // endregion
 
     private fun pinLabel(entity: PinEntity): String {
         return when (entity.sourceType) {

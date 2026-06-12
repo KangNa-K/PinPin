@@ -7,6 +7,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -110,6 +111,14 @@ class PinWindowView(
         /** Mutable so the "锁定" toolbar action can flip the flag
          *  on the live view without going through Room. */
         var locked: Boolean,
+        /** The pin's display order (1-based). Rendered as a small
+         *  red badge on the "收起" toolbar action and on the
+         *  minimized floating ball, so the user can tell which
+         *  pin is which. Matches [com.pinpin.app.data.PinEntity.zOrder]
+         *  at attach time. Mutable so [updateZOrder] can refresh
+         *  it in place after the repository renumbers the
+         *  remaining pins. */
+        var zOrder: Int,
     )
 
     // ----------------------------------------------------------------
@@ -456,6 +465,57 @@ class PinWindowView(
         }
     }
 
+    /**
+     * Synchronously decode the original pin image and hand it to
+     * [imageView]. Used by [enterAnnotationMode] when the pin
+     * zooms up to the full screen — Coil's cached drawable was
+     * sampled at the pin's original thumbnail size, so when the
+     * imageView suddenly jumps to fitW × fitH (the screen), a
+     * FIT_CENTER-scaled drawable would render as a tiny postage
+     * stamp surrounded by the card's blue gradient.
+     *
+     * We decode the full-resolution bitmap with an [inSampleSize]
+     * computed to keep memory bounded (target ≤ 2× the view
+     * dimensions), and set it as a [BitmapDrawable] directly on
+     * the imageView with `CENTER_CROP` so it fills the new
+     * imageCard. Synchronous on purpose: we need the bitmap in
+     * place before the user starts drawing, so they never see a
+     * blank blue card while Coil reloads in the background.
+     */
+    private fun loadOriginalBitmapSync(targetW: Int, targetH: Int) {
+        val uriStr = spec.imageUri ?: return
+        val uri = runCatching { Uri.parse(uriStr) }.getOrNull() ?: return
+        val bmp = runCatching {
+            val resolver = context.contentResolver
+            // First pass: just bounds, to compute inSampleSize
+            val boundsOpts = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            resolver.openInputStream(uri)?.use { input ->
+                BitmapFactory.decodeStream(input, null, boundsOpts)
+            }
+            val origW = boundsOpts.outWidth
+            val origH = boundsOpts.outHeight
+            if (origW <= 0 || origH <= 0) return@runCatching null
+            // Sample down so neither dimension exceeds 2× the
+            // target. The 2× headroom gives CENTER_CROP enough
+            // pixels to cover the view cleanly without bloating
+            // memory for a 4K screenshot.
+            var sample = 1
+            while (origW / sample > targetW * 2 || origH / sample > targetH * 2) {
+                sample *= 2
+            }
+            val opts = BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            resolver.openInputStream(uri)?.use { input ->
+                BitmapFactory.decodeStream(input, null, opts)
+            }
+        }.getOrNull() ?: return
+        imageView.setImageBitmap(bmp)
+    }
+
     // ----------------------------------------------------------------
     // Toolbar construction
     // ----------------------------------------------------------------
@@ -503,7 +563,7 @@ class PinWindowView(
             addView(makeToolbarButton(ACTION_SERIAL, R.drawable.ic_action_serial, R.string.pin_action_serial))
             addView(makeToolbarButton(ACTION_ANNOTATE, R.drawable.ic_action_annotate, R.string.pin_action_annotate))
             addView(makeToolbarButton(ACTION_ARROW, R.drawable.ic_action_arrow, R.string.pin_action_arrow))
-            // Group 4: 穿透 / 锁定
+            // Group 4: 穿透 / 锁定 / 收起
             addView(makeToolbarDivider())
             addView(makeToolbarButton(ACTION_PASSTHROUGH, R.drawable.ic_action_passthrough, R.string.pin_action_passthrough))
             // Default state is *unlocked*, so start with the
@@ -523,6 +583,17 @@ class PinWindowView(
                 }
                 lockButtonIcon = icon
             })
+            // Group 5: 收起 — tear down the pin window and
+            // replace it with a floating ball that shows the
+            // pin's image. Tapping the ball restores the full
+            // pin. Lives at the very right of the toolbar so the
+            // user is unlikely to hit it accidentally (it's
+            // separated from the destructive lock by a divider).
+            // The number badge is intentionally NOT shown here —
+            // it lives on the floating ball so the user only
+            // sees it once the pin has actually been minimized.
+            addView(makeToolbarDivider())
+            addView(makeToolbarButton(ACTION_MINIMIZE, R.drawable.ic_action_minimize, R.string.pin_action_minimize))
         }
     }
 
@@ -584,6 +655,88 @@ class PinWindowView(
             tag = ToolbarIconTag(iconRes)
         }
         container.addView(icon)
+        return container
+    }
+
+    /**
+     * Build the "收起" toolbar action as a [FrameLayout] (rather
+     * than a plain LinearLayout) so a small red zOrder badge
+     * can be overlaid on the button's top-right corner. The
+     * badge mirrors the one on the minimized floating ball —
+     * showing the same number across both surfaces means the
+     * user can keep track of "which pin is which" without
+     * reading the image content.
+     *
+     * The button's underlying behavior is the same as any
+     * other toolbar action: tap fires [ACTION_MINIMIZE].
+     */
+    private fun makeMinimizeButtonWithBadge(zOrderBadge: Int): View {
+        val density = resources.displayMetrics.density
+        val buttonW = dpToPx(TOOLBAR_BUTTON_DP)
+        val buttonH = dpToPx(TOOLBAR_HEIGHT_DP)
+        val container = android.widget.FrameLayout(context).apply {
+            isClickable = true
+            isFocusable = true
+            layoutParams = LinearLayout.LayoutParams(buttonW, buttonH).apply {
+                gravity = Gravity.CENTER
+            }
+            // Press feedback — same oval highlight as the
+            // other toolbar buttons.
+            val idle = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(Color.parseColor("#00000000"))
+            }
+            val pressed = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(Color.parseColor("#1F000000"))
+            }
+            background = android.graphics.drawable.StateListDrawable().apply {
+                addState(intArrayOf(android.R.attr.state_pressed), pressed)
+                addState(intArrayOf(), idle)
+            }
+            setOnClickListener { onActionClicked(ACTION_MINIMIZE) }
+        }
+        // The icon — same icon and tint rules as the other
+        // toolbar buttons.
+        val icon = ImageView(context).apply {
+            setImageResource(R.drawable.ic_action_minimize)
+            imageTintList = android.content.res.ColorStateList.valueOf(theme.iconColor)
+            contentDescription = context.getString(R.string.pin_action_minimize)
+            layoutParams = android.widget.FrameLayout.LayoutParams(
+                dpToPx(18), dpToPx(18),
+            ).apply {
+                gravity = Gravity.CENTER
+            }
+            tag = ToolbarIconTag(R.drawable.ic_action_minimize)
+        }
+        container.addView(icon)
+        // The badge — 16dp red circle, white text, anchored to
+        // the top-right corner with a tiny 1dp inset so it
+        // doesn't get clipped by the toolbar pill's rounded
+        // edge.
+        val badgeSize = (16 * density).toInt()
+        val badgeInset = (1 * density).toInt()
+        val badge = TextView(context).apply {
+            text = zOrderBadge.toString()
+            setTextColor(Color.WHITE)
+            textSize = 10f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setBackgroundColor(Color.TRANSPARENT)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(Color.parseColor("#E53935"))
+                setStroke((1 * density).toInt(), Color.WHITE)
+            }
+            layoutParams = android.widget.FrameLayout.LayoutParams(
+                badgeSize, badgeSize,
+            ).apply {
+                gravity = Gravity.TOP or Gravity.END
+                topMargin = badgeInset
+                marginEnd = badgeInset
+            }
+        }
+        container.addView(badge)
         return container
     }
 
@@ -812,6 +965,37 @@ class PinWindowView(
         _serialBadge = null
     }
 
+    /**
+     * Read-only access to the current serial-badge number, or
+     * `null` if the user hasn't enabled the badge for this
+     * pin. Used by [PinOverlayService.minimizePin] to forward
+     * the badge to the minimized ball so the user can still
+     * see which pin the ball represents.
+     *
+     * The number is read from the badge TextView's own text
+     * (the same value the user sees on the pin) rather than
+     * from a separate field on the spec — this way the badge
+     * is the single source of truth and there's no risk of
+     * the live value drifting from the spec.
+     */
+    fun serialBadgeNumber(): Int? = _serialBadge?.text?.toString()?.toIntOrNull()
+
+    /**
+     * Update the live view when the underlying pin's
+     * [com.pinpin.app.data.PinEntity.zOrder] changes (e.g.
+     * after [com.pinpin.app.data.PinRepository.renormalizeZOrders]
+     * following a delete or a toggle). The spec is updated
+     * and the on-pin serial badge, if currently shown, is
+     * re-stamped with the new number. The minimized-ball
+     * badge is recomputed from [serialBadgeNumber] on the
+     * next [PinOverlayService.minimizePin] call.
+     */
+    fun updateZOrder(newZ: Int) {
+        if (spec.zOrder == newZ) return
+        spec.zOrder = newZ
+        _serialBadge?.text = newZ.toString()
+    }
+
     fun isPassthrough(): Boolean = passthrough
 
     /**
@@ -918,16 +1102,20 @@ class PinWindowView(
 
         // 2. Calculate screen-fitting size. The imageCard shrinks so
         //    that the WHOLE wrapper (image + gap + annotation
-        //    toolbar) fits inside the screen with 32dp padding on
-        //    every side. Without subtracting [toolbarOverhead] here,
-        //    the wrapper bottom edge (image + 4dp + 40dp toolbar)
-        //    ends up below the screen, and the toolbar gets
-        //    clipped — exactly the bug this fix targets.
+        //    toolbar + brush sub-panel) fits inside the screen with
+        //    32dp padding on every side. We reserve vertical space
+        //    for the brush sub-panel up-front so toggling it
+        //    doesn't push the toolbar past the screen bottom or
+        //    outside the wrapper bounds.
         val metrics = windowManager.currentWindowMetrics
         val screenW = metrics.bounds.width()
         val screenH = metrics.bounds.height()
         val padding = (resources.displayMetrics.density * 32).toInt()
-        val toolbarOverheadForFit = dpToPx(TOOLBAR_GAP_DP) + dpToPx(TOOLBAR_HEIGHT_DP)
+        // Reserve enough for: gap (4dp) + main row (40dp) + gap
+        // (4dp) + brush sub-panel (40dp).
+        val brushPanelReserve = dpToPx(TOOLBAR_HEIGHT_DP)
+        val toolbarOverheadForFit =
+            dpToPx(TOOLBAR_GAP_DP) * 2 + dpToPx(TOOLBAR_HEIGHT_DP) + brushPanelReserve
         val maxW = screenW - padding * 2
         val maxH = screenH - padding * 2 - toolbarOverheadForFit
         val aspect = if (currentH > 0) currentW.toFloat() / currentH.toFloat() else 1f
@@ -952,6 +1140,26 @@ class PinWindowView(
         currentY = fitY
         applyLayoutSize(fitW, fitH)
         applyLayoutPosition(fitX, fitY)
+
+        // Reset the imageView to fill the new imageCard. The pin
+        // view's imageView is normally configured for a small
+        // thumbnail-sized card; once we zoom up to the screen
+        // size, a FIT_CENTER-scaled drawable would render at its
+        // intrinsic resolution in the middle of the card, leaving
+        // a huge band of the card's blue background visible around
+        // it. CENTER_CROP scales the drawable to fully cover the
+        // card (cropping overflow) so the user sees the image
+        // edge-to-edge while drawing on it.
+        //
+        // We also synchronously reload the source bitmap here
+        // (rather than reusing the cached thumbnail) so the
+        // imageView has a high-resolution drawable sized for the
+        // new view, not a tiny cached sample that would render
+        // blurry. The reload runs on the main thread but is
+        // bounded to ≤2× the target dimensions via inSampleSize,
+        // so it stays snappy even for 4K screenshots.
+        loadOriginalBitmapSync(fitW, fitH)
+        imageView.scaleType = ImageView.ScaleType.CENTER_CROP
 
         // 3. Add drawing overlay
         val overlay = DrawingOverlayView(context).apply {
@@ -1180,6 +1388,22 @@ class PinWindowView(
             topMargin = currentH + dpToPx(TOOLBAR_GAP_DP)
         }
         toolbar.requestLayout()
+
+        // Grow the wrapper so the sub-panel is not clipped by
+        // the WindowManager height. The wrapper was sized for
+        // image + gap + base toolbar only at enter-time; if the
+        // sub-panel is now open, the wrapper's window height
+        // must grow by the same amount to avoid the panel being
+        // chopped at the wrapper's bottom edge.
+        val wrapperLp = layoutParams as? WindowManager.LayoutParams
+        if (wrapperLp != null) {
+            val gap = dpToPx(TOOLBAR_GAP_DP)
+            val newH = currentH + gap + totalH
+            if (newH != wrapperLp.height) {
+                wrapperLp.height = newH
+                runCatching { windowManager.updateViewLayout(this, wrapperLp) }
+            }
+        }
     }
 
     private fun buildBrushPanel(): LinearLayout {
@@ -1929,7 +2153,10 @@ class PinWindowView(
         // 4 dividers × 1dp. The wrapper is widened to at least this
         // many pixels so the toolbar never gets clipped on narrow
         // pins.
-        private const val MIN_TOOLBAR_WIDTH_DP = 9 * 40f + 4 * 1f
+        // 10 icon buttons (40dp each) + 5 dividers (1dp each).
+        // The wrapper must be at least this wide so the toolbar
+        // pill can fit without clipping its rightmost button.
+        private const val MIN_TOOLBAR_WIDTH_DP = 10 * 40f + 5 * 1f
         private const val CLOSE_BUTTON_SIZE_DP = 40f
         private const val CLOSE_BUTTON_MARGIN_DP = 8f
 
@@ -1961,6 +2188,10 @@ class PinWindowView(
         const val ACTION_ARROW = "arrow"
         const val ACTION_PASSTHROUGH = "passthrough"
         const val ACTION_LOCK = "lock"
+        // "Minimize" — tear down the pin window and replace it
+        // with a small floating ball that shows the pin's
+        // image. Tapping the ball restores the full pin.
+        const val ACTION_MINIMIZE = "minimize"
         // Internal-only — fired by the "×" cancel button on the
         // annotation toolbar, never from the main toolbar.
         const val ACTION_CANCEL_ANNOTATE = "cancel_annotate"
