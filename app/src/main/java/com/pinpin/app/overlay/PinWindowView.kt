@@ -1203,7 +1203,7 @@ class PinWindowView(
         // 3. Add drawing overlay
         val overlay = DrawingOverlayView(context).apply {
             mode = drawingMode
-            strokeColor = Color.RED
+            strokeColor = selectedAnnotationColor
             // Eraser color matches the toolbar surface so the
             // rubber-band visually "wipes" the area. Light theme
             // uses the white surface; dark uses the dark surface.
@@ -1316,6 +1316,26 @@ class PinWindowView(
     private var brushPanelVisible: Boolean = false
 
     /**
+     * The color currently selected on the annotation toolbar's 8
+     * swatch row. Updated when the user taps a swatch; the toolbar
+     * is rebuilt only on entry to annotation mode, so the active
+     * ring is updated in place by re-tagging the swatch views
+     * (see [refreshSwatchSelection]). Default mirrors the historical
+     * red swatch on the first two swatches of the old toolbar, so
+     * an existing user picks up the same color they had before.
+     */
+    private var selectedAnnotationColor: Int = Color.RED
+
+    /**
+     * The eight swatch views on the annotation toolbar, kept by
+     * reference so [refreshSwatchSelection] can update their ring
+     * stroke (3dp white when selected, 1dp 33%-white otherwise)
+     * without rebuilding the toolbar. Indexed by their position in
+     * [ANNOTATION_SWATCH_COLORS].
+     */
+    private val swatchViews: MutableList<View> = mutableListOf()
+
+    /**
      * Build the annotation toolbar in the order requested:
      * [红] [黑] [签字笔] [橡皮擦] [撤销] [重做] [保存] [应用] [取消]
      *
@@ -1348,16 +1368,27 @@ class PinWindowView(
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        // 1. 红色色块
-        mainRow.addView(makeColorSwatch(Color.RED, "红") {
-            drawingOverlay?.strokeColor = Color.RED
-            drawingOverlay?.mode = DrawingOverlayView.Mode.PEN
-        })
-        // 2. 黑色色块
-        mainRow.addView(makeColorSwatch(Color.BLACK, "黑") {
-            drawingOverlay?.strokeColor = Color.BLACK
-            drawingOverlay?.mode = DrawingOverlayView.Mode.PEN
-        })
+        // 1-8. 8-swatch color row (red, black, orange, yellow, green,
+        //      cyan, blue, purple). The active swatch shows a 3dp
+        //      white ring; the others show a 1dp 33%-white ring.
+        //      Selection state is held in [selectedAnnotationColor]
+        //      and re-applied to the swatches by
+        //      [refreshSwatchSelection] on every change.
+        swatchViews.clear()
+        val palette = ANNOTATION_SWATCH_COLORS
+        val swatchLabels = arrayOf("红", "黑", "橙", "黄", "绿", "青", "蓝", "紫")
+        for (i in palette.indices) {
+            val color = palette[i]
+            val label = swatchLabels[i]
+            val swatch = makeColorSwatch(
+                color = color,
+                label = label,
+                isSelected = color == selectedAnnotationColor,
+                onPick = { selectAnnotationColor(color) },
+            )
+            swatchViews.add(swatch)
+            mainRow.addView(swatch)
+        }
         mainRow.addView(makeVerticalDivider())
         // 3. 签字笔 — toggles the brush sub-panel
         mainRow.addView(makeAnnotationActionButton(R.drawable.ic_action_annotate, "签字笔") {
@@ -1529,9 +1560,19 @@ class PinWindowView(
         }
     }
 
-    private fun makeColorSwatch(color: Int, label: String, onPick: () -> Unit): View {
+    private fun makeColorSwatch(
+        color: Int,
+        label: String,
+        isSelected: Boolean = false,
+        onPick: () -> Unit,
+    ): View {
         val density = resources.displayMetrics.density
         val size = (28 * density).toInt()
+        // Selected swatch: keep the color fill but draw a thicker
+        // ring on the outside so the active choice is obvious
+        // against the other 7 swatches in the row.
+        val strokePx = if (isSelected) (3 * density).toInt() else (1 * density).toInt()
+        val strokeColor = if (isSelected) Color.WHITE else Color.parseColor("#33FFFFFF")
         return LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -1546,9 +1587,54 @@ class PinWindowView(
             background = android.graphics.drawable.GradientDrawable().apply {
                 shape = android.graphics.drawable.GradientDrawable.OVAL
                 setColor(color)
-                setStroke((1 * density).toInt(), Color.parseColor("#33FFFFFF"))
+                setStroke(strokePx, strokeColor)
             }
             setOnClickListener { onPick() }
+        }
+    }
+
+    /**
+     * Switch the active annotation color. Updates the drawing
+     * overlay's stroke color (the next stroke will use it),
+     * re-tags the toolbar swatches so the active one shows the
+     * selection ring, and remembers the choice for the duration
+     * of this annotation session.
+     *
+     * Idempotent: picking the already-active color is a no-op
+     * (no view invalidation, no overlay re-tag) so the toolbar
+     * doesn't flicker if the user double-taps.
+     */
+    private fun selectAnnotationColor(color: Int) {
+        if (selectedAnnotationColor == color) return
+        selectedAnnotationColor = color
+        drawingOverlay?.strokeColor = color
+        // Switch back to PEN mode in case the user was on the
+        // eraser — picking a color while erasing is unambiguously
+        // a "start drawing again" intent.
+        if (drawingOverlay?.mode == DrawingOverlayView.Mode.ERASER) {
+            drawingOverlay?.mode = DrawingOverlayView.Mode.PEN
+        }
+        refreshSwatchSelection()
+    }
+
+    /**
+     * Re-stamp the active-ring stroke on each of the 8 swatch
+     * views based on the current [selectedAnnotationColor]. The
+     * swatches' backgrounds are GradientDrawables, so we mutate
+     * their stroke in place — no view rebuild, no flicker. Called
+     * once after entering annotation mode (initial state) and on
+     * every [selectAnnotationColor] call.
+     */
+    private fun refreshSwatchSelection() {
+        val density = resources.displayMetrics.density
+        val palette = ANNOTATION_SWATCH_COLORS
+        for ((i, view) in swatchViews.withIndex()) {
+            val isActive = i < palette.size && palette[i] == selectedAnnotationColor
+            val strokePx = if (isActive) (3 * density).toInt() else (1 * density).toInt()
+            val strokeColor = if (isActive) Color.WHITE else Color.parseColor("#33FFFFFF")
+            (view.background as? android.graphics.drawable.GradientDrawable)?.apply {
+                setStroke(strokePx, strokeColor)
+            }
         }
     }
 
@@ -2182,6 +2268,29 @@ class PinWindowView(
         private const val CORNER_HIT_RADIUS_DP = 40f
         private const val HANDLE_RADIUS_DP = 7f
         private const val HANDLE_STROKE_DP = 2f
+
+        /**
+         * Eight fixed colors on the annotation toolbar's swatch row.
+         * The first two (red, black) are the original choices that
+         * the toolbar shipped with; the other six fill out a basic
+         * 8-color palette. The 9th slot (rainbow / palette icon)
+         * is added later as a "调色盘" entry point for custom HSV
+         * — not part of this list because it does not pick a color
+         * itself.
+         *
+         * Order matters: the toolbar renders them in array order,
+         * left to right.
+         */
+        val ANNOTATION_SWATCH_COLORS: IntArray = intArrayOf(
+            Color.RED,
+            Color.BLACK,
+            Color.parseColor("#FF9800"), // orange
+            Color.parseColor("#FFEB3B"), // yellow
+            Color.parseColor("#4CAF50"), // green
+            Color.parseColor("#00BCD4"), // cyan
+            Color.parseColor("#2196F3"), // blue
+            Color.parseColor("#9C27B0"), // purple
+        )
 
         // Layout measurements.
         private const val CORNER_RADIUS_DP = 16f
