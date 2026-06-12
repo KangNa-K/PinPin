@@ -908,7 +908,19 @@ class PinWindowView(
         // UI after light / dark mode switches.
         closeButton.setImageResource(R.drawable.ic_close)
         closeButton.imageTintList = ColorStateList.valueOf(theme.iconColor)
-        closeButton.setOnClickListener { onCloseClicked() }
+        // While in annotation mode the X close button is
+        // the user's escape hatch: tapping it exits the
+        // annotation mode (discarding any in-progress
+        // strokes) rather than tearing the pin down. In
+        // every other state the X button does the usual
+        // thing: close the pin window via the host callback.
+        closeButton.setOnClickListener {
+            if (annotationMode) {
+                exitAnnotationMode(discardChanges = true)
+            } else {
+                onCloseClicked()
+            }
+        }
         // When passthrough is on, add FLAG_NOT_TOUCHABLE so that
         // touches on the entire window pass through to the
         // underlying app. Returning false from onTouchEvent does
@@ -1139,22 +1151,19 @@ class PinWindowView(
         preAnnotationW = currentW
         preAnnotationH = currentH
 
-        // 2. Calculate screen-fitting size. The imageCard shrinks so
-        //    that the WHOLE wrapper (image + gap + annotation
-        //    toolbar + brush sub-panel) fits inside the screen with
-        //    32dp padding on every side. We reserve vertical space
-        //    for the brush sub-panel up-front so toggling it
-        //    doesn't push the toolbar past the screen bottom or
-        //    outside the wrapper bounds.
+        // Auto-fit the imageCard to the screen with 32dp
+        // padding on every side, so the user has a large
+        // canvas to draw on and the annotation toolbar
+        // below the image is fully visible. The vertical
+        // reserve accounts for: top gap + main row + bottom
+        // gap. (The old brush sub-panel was removed so
+        // there's no longer a sub-panel reserve.)
         val metrics = windowManager.currentWindowMetrics
         val screenW = metrics.bounds.width()
         val screenH = metrics.bounds.height()
         val padding = (resources.displayMetrics.density * 32).toInt()
-        // Reserve enough for: gap (4dp) + main row (40dp) + gap
-        // (4dp) + brush sub-panel (40dp).
-        val brushPanelReserve = dpToPx(TOOLBAR_HEIGHT_DP)
         val toolbarOverheadForFit =
-            dpToPx(TOOLBAR_GAP_DP) * 2 + dpToPx(TOOLBAR_HEIGHT_DP) + brushPanelReserve
+            dpToPx(TOOLBAR_GAP_DP) * 2 + dpToPx(TOOLBAR_HEIGHT_DP)
         val maxW = screenW - padding * 2
         val maxH = screenH - padding * 2 - toolbarOverheadForFit
         val aspect = if (currentH > 0) currentW.toFloat() / currentH.toFloat() else 1f
@@ -1168,11 +1177,11 @@ class PinWindowView(
             fitH = (maxW / aspect).toInt()
         }
 
-        // Center on screen
+        // Centre on screen.
         val fitX = (screenW - fitW) / 2
         val fitY = (screenH - fitH) / 2
 
-        // Apply the zoom
+        // Apply the zoom.
         currentW = fitW
         currentH = fitH
         currentX = fitX
@@ -1180,23 +1189,22 @@ class PinWindowView(
         applyLayoutSize(fitW, fitH)
         applyLayoutPosition(fitX, fitY)
 
-        // Reset the imageView to fill the new imageCard. The pin
-        // view's imageView is normally configured for a small
-        // thumbnail-sized card; once we zoom up to the screen
-        // size, a FIT_CENTER-scaled drawable would render at its
-        // intrinsic resolution in the middle of the card, leaving
-        // a huge band of the card's blue background visible around
-        // it. CENTER_CROP scales the drawable to fully cover the
-        // card (cropping overflow) so the user sees the image
+        // Reset the imageView to fill the new imageCard. A
+        // FIT_CENTER-scaled drawable would render at its
+        // intrinsic resolution in the middle of the card,
+        // leaving a huge band of the card's blue background
+        // visible around it. CENTER_CROP scales the drawable
+        // to fully cover the card so the user sees the image
         // edge-to-edge while drawing on it.
         //
         // We also synchronously reload the source bitmap here
         // (rather than reusing the cached thumbnail) so the
-        // imageView has a high-resolution drawable sized for the
-        // new view, not a tiny cached sample that would render
-        // blurry. The reload runs on the main thread but is
-        // bounded to ≤2× the target dimensions via inSampleSize,
-        // so it stays snappy even for 4K screenshots.
+        // imageView has a high-resolution drawable sized for
+        // the new view, not a tiny cached sample that would
+        // render blurry. The reload runs on the main thread
+        // but is bounded to ≤2× the target dimensions via
+        // inSampleSize, so it stays snappy even for 4K
+        // screenshots.
         loadOriginalBitmapSync(fitW, fitH)
         imageView.scaleType = ImageView.ScaleType.CENTER_CROP
 
@@ -1215,9 +1223,6 @@ class PinWindowView(
         }
         imageCard.addView(overlay)
         drawingOverlay = overlay
-        // Brush sub-panel starts collapsed; the user opens it by
-        // tapping the pen button.
-        brushPanelVisible = false
 
         // 4. Show annotation toolbar
         val annToolbar = buildAnnotationToolbar()
@@ -1236,9 +1241,16 @@ class PinWindowView(
         // opened).
         annToolbar.post { repositionAnnotationToolbar() }
 
-        // 5. Hide regular toolbar and close button
+        // 5. Hide the regular toolbar so the annotation
+        //    toolbar below the image is the only thing
+        //    drawing the user's attention — but keep the
+        //    close button (X) visible as the escape hatch.
+        //    Its click handler is wired to exit annotation
+        //    mode (set up in [setOnClickListener] below),
+        //    so the user always has a way to back out
+        //    even if the annotation toolbar overflows off
+        //    the bottom of the screen.
         toolbar.alpha = 0f
-        closeButton.alpha = 0f
     }
 
     /**
@@ -1287,13 +1299,21 @@ class PinWindowView(
         annotationToolbar?.let { removeView(it) }
         annotationToolbar = null
 
-        // 3. Restore original size/position
+        // 3. Restore original size/position. enterAnnotationMode
+        //    re-fits the imageCard to the screen, so we need
+        //    to put it back at the user's pre-annotation state.
+        //    This is the "image auto-returns to its original
+        //    position" the user has now confirmed they want.
         currentW = preAnnotationW
         currentH = preAnnotationH
         currentX = preAnnotationX
         currentY = preAnnotationY
         applyLayoutSize(preAnnotationW, preAnnotationH)
         applyLayoutPosition(preAnnotationX, preAnnotationY)
+        // Reset the imageView's scaleType back to the small
+        // pin default so the image isn't cropped at
+        // thumbnail size.
+        imageView.scaleType = ImageView.ScaleType.FIT_CENTER
 
         // 4. Show regular toolbar and close button
         if (toolbarShown) {
@@ -1312,10 +1332,7 @@ class PinWindowView(
      * slider updates the active style / width on the drawing
      * overlay.
      */
-    private var brushPanel: LinearLayout? = null
-    private var brushPanelVisible: Boolean = false
-
-    /**
+/**
      * The color currently selected on the annotation toolbar's 8
      * swatch row. Updated when the user taps a swatch; the toolbar
      * is rebuilt only on entry to annotation mode, so the active
@@ -1390,14 +1407,27 @@ class PinWindowView(
             mainRow.addView(swatch)
         }
         mainRow.addView(makeVerticalDivider())
-        // 3. 签字笔 — toggles the brush sub-panel
+        // 3. 签字笔 — simply switches drawing mode back to
+        //    PEN. The old design opened a brush-style
+        //    sub-panel here; the user asked to remove
+        //    that entire sub-panel, so this button is
+        //    now a flat mode toggle.
         mainRow.addView(makeAnnotationActionButton(R.drawable.ic_action_annotate, "签字笔") {
-            toggleBrushPanel()
+            drawingOverlay?.mode = DrawingOverlayView.Mode.PEN
         })
-        // 4. 橡皮擦
+        // 4. 橡皮擦 — same flat mode toggle, no sub-panel.
         mainRow.addView(makeAnnotationActionButton(R.drawable.ic_action_eraser, "橡皮擦") {
             drawingOverlay?.mode = DrawingOverlayView.Mode.ERASER
         })
+        // 4b. Brush-size slider. Both pen and eraser read
+        //     strokeWidth off the same drawingOverlay, so
+        //     dragging here changes the size for whichever
+        //     mode the user is in (and the next stroke they
+        //     make in the OTHER mode). The leftmost child is
+        //     a live preview circle whose diameter mirrors
+        //     the current value, so the user can see what
+        //     they're about to draw.
+        mainRow.addView(makeBrushSizeSlider())
         mainRow.addView(makeVerticalDivider())
         // 5. 撤销
         mainRow.addView(makeAnnotationActionButton(R.drawable.ic_action_undo, "撤销") {
@@ -1422,37 +1452,20 @@ class PinWindowView(
         })
 
         toolbar.addView(mainRow)
-
-        // ---- Brush sub-panel (hidden by default) ----
-        val panel = buildBrushPanel()
-        panel.visibility = View.GONE
-        toolbar.addView(panel)
-        brushPanel = panel
-
+        // The old brush sub-panel (3 brush-style buttons +
+        // pen/eraser segmented toggle + width slider) has
+        // been removed per user request. Pen and eraser
+        // are now plain mode toggles above; brush style
+        // and stroke width are stuck at their defaults.
         return toolbar
-    }
-
-    private fun toggleBrushPanel() {
-        val panel = brushPanel ?: return
-        brushPanelVisible = !brushPanelVisible
-        panel.visibility = if (brushPanelVisible) View.VISIBLE else View.GONE
-        repositionAnnotationToolbar()
     }
 
     private fun repositionAnnotationToolbar() {
         val toolbar = annotationToolbar ?: return
-        val panel = brushPanel
-        val panelH = if (panel != null && panel.visibility == View.VISIBLE) {
-            panel.measure(
-                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
-                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
-            )
-            panel.measuredHeight
-        } else {
-            0
-        }
+        // No brush sub-panel anymore; toolbar height is
+        // just the base pill plus the bottom gap.
         val baseH = dpToPx(TOOLBAR_HEIGHT_DP)
-        val totalH = baseH + panelH + dpToPx(TOOLBAR_GAP_DP)
+        val totalH = baseH + dpToPx(TOOLBAR_GAP_DP)
         (toolbar.layoutParams as? FrameLayout.LayoutParams)?.apply {
             height = totalH
             topMargin = currentH + dpToPx(TOOLBAR_GAP_DP)
@@ -1476,91 +1489,84 @@ class PinWindowView(
         }
     }
 
-    private fun buildBrushPanel(): LinearLayout {
+
+    private fun makeBrushSizeSlider(): View {
         val density = resources.displayMetrics.density
+        val currentWidthPx = drawingOverlay?.strokeWidth ?: 6f
+        // Live preview circle — diameter tracks the current
+        // strokeWidth so the user gets immediate visual
+        // feedback as they drag. Min 8dp so a 2dp brush is
+        // still visible on the toolbar.
+        val preview = View(context).apply {
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(theme.iconColor)
+            }
+            val px = (currentWidthPx * density).toInt()
+                .coerceAtLeast((8 * density).toInt())
+            layoutParams = LinearLayout.LayoutParams(px, px).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                marginStart = (4 * density).toInt()
+                marginEnd = (4 * density).toInt()
+            }
+        }
+        // Divider between preview and slider, matching the
+        // visual rhythm of the rest of the toolbar.
+        val divider = View(context).apply {
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                setColor(Color.parseColor("#22000000"))
+                setSize(dpToPx(1), dpToPx(20))
+            }
+            layoutParams = LinearLayout.LayoutParams(dpToPx(1), dpToPx(20)).apply {
+                gravity = Gravity.CENTER
+                marginStart = (4 * density).toInt()
+                marginEnd = (4 * density).toInt()
+            }
+        }
+        // The actual slider. Range: 2dp to 24dp (24px on a
+        // baseline 1.0 density, 48px on 2.0 — the widest
+        // brush is still well within the wrapper's imageCard
+        // bounds).
+        val slider = android.widget.SeekBar(context).apply {
+            max = 100
+            progress = ((currentWidthPx - 2f) / 22f * 100f).toInt()
+                .coerceIn(0, 100)
+            layoutParams = LinearLayout.LayoutParams(
+                (140 * density).toInt(),
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            )
+            contentDescription = "笔刷大小"
+            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(
+                    seekBar: android.widget.SeekBar?,
+                    progress: Int,
+                    fromUser: Boolean,
+                ) {
+                    val baseWidth = 2f + (progress / 100f) * 22f
+                    drawingOverlay?.strokeWidth = baseWidth
+                    val newPx = (baseWidth * density).toInt()
+                        .coerceAtLeast((8 * density).toInt())
+                    preview.layoutParams = preview.layoutParams.apply {
+                        width = newPx
+                        height = newPx
+                    }
+                    preview.requestLayout()
+                }
+                override fun onStartTrackingTouch(seekBar: android.widget.SeekBar?) {}
+                override fun onStopTrackingTouch(seekBar: android.widget.SeekBar?) {}
+            })
+        }
         return LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            val pad = (4 * density).toInt()
-            setPadding(pad, pad, pad, pad)
-            addView(makeBrushStyleButton(DrawingOverlayView.BrushStyle.PEN, "钢笔"))
-            addView(makeBrushStyleButton(DrawingOverlayView.BrushStyle.HIGHLIGHTER, "高亮笔"))
-            addView(makeBrushStyleButton(DrawingOverlayView.BrushStyle.CALLIGRAPHY, "毛笔"))
-            addView(View(context).apply {
-                background = android.graphics.drawable.GradientDrawable().apply {
-                    shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                    setColor(Color.parseColor("#22000000"))
-                    setSize(dpToPx(1), dpToPx(20))
-                }
-                layoutParams = LinearLayout.LayoutParams(dpToPx(1), dpToPx(20)).apply {
-                    gravity = Gravity.CENTER
-                    marginStart = (6 * density).toInt()
-                    marginEnd = (6 * density).toInt()
-                }
-            })
-            val slider = android.widget.SeekBar(context).apply {
-                max = 100
-                progress = 40
-                layoutParams = LinearLayout.LayoutParams(
-                    (120 * density).toInt(),
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                )
-                setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(seekBar: android.widget.SeekBar?, progress: Int, fromUser: Boolean) {
-                        val baseWidth = 2f + (progress / 100f) * 16f
-                        drawingOverlay?.strokeWidth = baseWidth
-                    }
-                    override fun onStartTrackingTouch(seekBar: android.widget.SeekBar?) {}
-                    override fun onStopTrackingTouch(seekBar: android.widget.SeekBar?) {}
-                })
-            }
+            addView(preview)
+            addView(divider)
             addView(slider)
         }
     }
 
-    private fun makeBrushStyleButton(
-        style: DrawingOverlayView.BrushStyle,
-        label: String,
-    ): View {
-        val density = resources.displayMetrics.density
-        val size = (32 * density).toInt()
-        return LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            isClickable = true
-            isFocusable = true
-            contentDescription = label
-            layoutParams = LinearLayout.LayoutParams(size, size).apply {
-                gravity = Gravity.CENTER
-                marginStart = (2 * density).toInt()
-                marginEnd = (2 * density).toInt()
-            }
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(theme.surfaceFill)
-                setStroke((2 * density).toInt(), theme.iconColor)
-            }
-            val preview = View(context).apply {
-                background = android.graphics.drawable.GradientDrawable().apply {
-                    shape = when (style) {
-                        DrawingOverlayView.BrushStyle.HIGHLIGHTER -> android.graphics.drawable.GradientDrawable.RECTANGLE
-                        else -> android.graphics.drawable.GradientDrawable.OVAL
-                    }
-                    setColor(theme.iconColor)
-                }
-                layoutParams = LinearLayout.LayoutParams(
-                    if (style == DrawingOverlayView.BrushStyle.HIGHLIGHTER) (16 * density).toInt() else (10 * density).toInt(),
-                    if (style == DrawingOverlayView.BrushStyle.HIGHLIGHTER) (6 * density).toInt() else (10 * density).toInt(),
-                )
-            }
-            addView(preview)
-            setOnClickListener {
-                drawingOverlay?.brushStyle = style
-            }
-        }
-    }
-
-    private fun makeColorSwatch(
+        private fun makeColorSwatch(
         color: Int,
         label: String,
         isSelected: Boolean = false,
@@ -1588,6 +1594,23 @@ class PinWindowView(
                 shape = android.graphics.drawable.GradientDrawable.OVAL
                 setColor(color)
                 setStroke(strokePx, strokeColor)
+            }
+            // Own the entire touch stream so the wrapper's
+            // onTouchEvent never sees anything from this swatch.
+            // Without this, a sloppy tap that crossed the
+            // swatch boundary on the way to UP would be
+            // picked up as an in-card drag, and the wrapper
+            // would translate the imageCard in response —
+            // which is the "image shifts after tapping a
+            // color" symptom the user reported. Returning
+            // true here consumes the event; performClick()
+            // fires the OnClickListener on ACTION_UP so the
+            // color selection still goes through.
+            setOnTouchListener { v, event ->
+                if (event.actionMasked == MotionEvent.ACTION_UP) {
+                    v.performClick()
+                }
+                true
             }
             setOnClickListener { onPick() }
         }
@@ -2256,6 +2279,7 @@ class PinWindowView(
     /** Int overload — the `f` suffix is annoying to scatter across
      *  every literal call site. */
     private fun dpToPx(dp: Int): Int = dpToPx(dp.toFloat())
+
 
     companion object {
         private const val TAG = "PinWindowView"
