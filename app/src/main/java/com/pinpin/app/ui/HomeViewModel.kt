@@ -71,9 +71,24 @@ class HomeViewModel @Inject constructor(
         viewModelScope.launch { historyRepository.repinAsPin(item) }
     }
 
+    /** Batch re-pin a list of history entries (multi-select flow). */
+    fun repinManyFromHistory(items: List<ScreenshotHistoryEntity>) {
+        viewModelScope.launch {
+            items.forEach { historyRepository.repinAsPin(it) }
+        }
+    }
+
     /** Delete a history entry (and its backing file). */
     fun deleteHistory(id: String) {
         viewModelScope.launch { historyRepository.delete(id) }
+    }
+
+    /** Batch delete a list of history entries (multi-select flow). */
+    fun deleteHistories(ids: List<String>) {
+        if (ids.isEmpty()) return
+        viewModelScope.launch {
+            ids.forEach { historyRepository.delete(it) }
+        }
     }
 
     private suspend fun readImageSize(uri: Uri): Pair<Int, Int> = withContext(Dispatchers.IO) {
