@@ -59,4 +59,12 @@ interface PinDao {
 
     @Query("UPDATE pins SET imageUri = :imageUri WHERE id = :id")
     suspend fun updateImageUri(id: String, imageUri: String)
+
+    /**
+     * Stamp the post-annotation URI onto the pin. Pass `null` to
+     * revert to the original [PinEntity.imageUri] (used when the
+     * user discards an in-progress annotation).
+     */
+    @Query("UPDATE pins SET annotatedImageUri = :annotatedImageUri WHERE id = :id")
+    suspend fun updateAnnotatedImageUri(id: String, annotatedImageUri: String?)
 }

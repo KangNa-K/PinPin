@@ -25,6 +25,11 @@ import androidx.room.PrimaryKey
  *  - [zOrder]: explicit z-order. Higher = drawn on top. The repository
  *    assigns this on insert (max(existing) + 1) so the most recently
  *    inserted pin sits above the others.
+ *  - [annotatedImageUri]: if non-null, the pin's overlay layer renders
+ *    this URI instead of [imageUri]. Written when the user commits a
+ *    freehand annotation (drawing / arrow / highlight) over the pinned
+ *    image; the original is preserved by never being overwritten.
+ *    See [com.pinpin.app.overlay.AnnotatePopupView] for the writer.
  */
 @Entity(tableName = "pins")
 data class PinEntity(
@@ -42,4 +47,11 @@ data class PinEntity(
     val rotation: Int = 0,
     /** Whether the image is horizontally flipped. */
     val flipped: Boolean = false,
+    /**
+     * URI of the post-annotation image, or null if the pin has never
+     * been annotated. The original [imageUri] is kept untouched; this
+     * field points at a new file in the app's private cache dir. The
+     * overlay service prefers this URI over [imageUri] when non-null.
+     */
+    val annotatedImageUri: String? = null,
 )

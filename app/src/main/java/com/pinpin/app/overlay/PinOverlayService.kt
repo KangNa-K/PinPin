@@ -257,6 +257,19 @@ class PinOverlayService : Service() {
                     // next [setAllPinsVisible] call will pick it up.
                     return@forEach
                 }
+                if (minimizedBalls.containsKey(entity.id)) {
+                    // Pin was collapsed to a floating ball by the
+                    // user. The [PinWindowView] was deliberately
+                    // removed from [activePins] by [minimizePin] —
+                    // re-attaching it here would spawn a SECOND
+                    // window for the same image, leaving the ball
+                    // AND the full pin on screen at the same time.
+                    // The floating ball is the user's chosen
+                    // surface for this pin; a new
+                    // [restorePin] call is the only path that
+                    // should bring it back.
+                    return@forEach
+                }
                 attachNew(entity)
             } else {
                 // Update position / size in case the user dragged/resized
@@ -789,12 +802,17 @@ class PinOverlayService : Service() {
                 }
                 bitmap.recycle()
                 val newUri = Uri.fromFile(file).toString()
-                // Update the pin's imageUri in the database
-                pinRepository.updateImageUri(entity.id, newUri)
-                // Update the live view on the main thread
+                // Persist the post-annotation URI in its own column.
+                // The original [PinEntity.imageUri] is left untouched
+                // so the user can always revert to the pre-annotation
+                // image; the overlay service prefers annotatedImageUri
+                // over imageUri when both are set.
+                pinRepository.updateAnnotatedImage(entity.id, newUri)
+                // Update the live view on the main thread. The view's
+                // [PinWindowView.setAnnotatedImageUri] updates only the
+                // display state — `spec.imageUri` is left intact.
                 scope.launch(Dispatchers.Main) {
-                    view.spec.imageUri = newUri
-                    view.loadImage(newUri)
+                    view.setAnnotatedImageUri(newUri)
                 }
             }.onFailure { Log.e(TAG, "saveAnnotatedImage failed for ${entity.id}", it) }
         }

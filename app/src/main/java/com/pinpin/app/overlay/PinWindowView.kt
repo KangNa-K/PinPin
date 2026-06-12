@@ -103,6 +103,20 @@ class PinWindowView(
          *  resolves and we need to swap the placeholder for the
          *  real drawable. */
         var imageUri: String?,
+        /**
+         * Optional post-annotation image URI. When non-null, the
+         * view renders this image in [imageView] instead of
+         * [imageUri] (the original is preserved on disk). Set by
+         * [setAnnotatedImageUri] after the user commits an
+         * annotation; cleared (back to `null`) to revert to the
+         * original.
+         *
+         * Kept separate from [imageUri] so:
+         *  - the original can be restored without a Room round-trip
+         *  - the "redo annotation" path can read the original
+         *    without the annotated version getting overwritten
+         */
+        var annotatedImageUri: String? = null,
         val sourceType: String,
         val initialX: Int,
         val initialY: Int,
@@ -397,7 +411,9 @@ class PinWindowView(
         imageCard.addView(closeButton)
 
         // Optional test-pin label (shown only when there's no image).
-        val imageUri = spec.imageUri
+        // Prefer the annotated URI if one is set — same image the user
+        // sees should drive the label-vs-image branch.
+        val imageUri = spec.annotatedImageUri ?: spec.imageUri
         label = if (imageUri == null || imageUri.startsWith("pinpin://")) {
             TextView(context).apply {
                 text = spec.label
@@ -462,6 +478,29 @@ class PinWindowView(
             if (result !is SuccessResult) {
                 Log.w(TAG, "Image load failed for $uriString; falling back to placeholder")
             }
+        }
+    }
+
+    /**
+     * Swap the pin's displayed image to a freshly-rendered
+     * annotation. Stores the URI on [PinSpec.annotatedImageUri]
+     * (so subsequent re-attaches / clones pick it up) and reloads
+     * the bitmap into [imageView] without touching
+     * [PinSpec.imageUri] — the original is preserved on disk and
+     * can be restored by passing `null`.
+     *
+     * The original `imageUri` is intentionally NOT overwritten:
+     * doing so would destroy the path back to the pre-annotation
+     * image, making "discard this annotation and go back" impossible.
+     *
+     * Idempotent: passing the same URI twice is a no-op.
+     */
+    fun setAnnotatedImageUri(uri: String?) {
+        if (spec.annotatedImageUri == uri) return
+        spec.annotatedImageUri = uri
+        val target = uri ?: spec.imageUri
+        if (target != null) {
+            loadImage(target)
         }
     }
 

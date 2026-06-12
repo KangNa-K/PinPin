@@ -217,6 +217,21 @@ class PinRepository @Inject constructor(
         dao.updateImageUri(id, imageUri)
     }
 
+    /**
+     * Commit a freshly-rendered annotation. The overlay service
+     * writes the composited bitmap to the app's private cache dir
+     * and hands the file URI here; the entity is updated in-place
+     * without a re-fetch so the live [PinWindowView] sees the new
+     * image on the next draw.
+     *
+     * Pass `null` to [annotatedImageUri] to revert to the original
+     * image (e.g. when the user cancels an in-progress annotation
+     * without saving).
+     */
+    suspend fun updateAnnotatedImage(id: String, annotatedImageUri: String?) {
+        dao.updateAnnotatedImageUri(id, annotatedImageUri)
+    }
+
     // endregion
 
     private fun fitInside(
