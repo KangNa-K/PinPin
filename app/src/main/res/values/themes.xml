@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+        Base app theme (light variant — picked when the system is NOT in
+        night mode). Parent is android:Theme.Material.Light.NoActionBar so
+        inherited platform defaults (text colors, ripples, ...) are light
+        too. The dark counterpart lives in values-night/themes.xml.
+
+        The Compose MaterialTheme (PinPinTheme) provides the actual UI
+        tokens; this XML theme just configures the splash window
+        background and the system-bar appearance. enableEdgeToEdge() in
+        MainActivity / OnboardingActivity further refines the system
+        bar icons at runtime.
+
+        We avoid android:Theme.DeviceDefault.DayNight.* because that
+        style does not exist in the platform themes — DayNight is only
+        available via the AppCompat / MaterialComponents libraries,
+        which this project does not depend on. Splitting the XML theme
+        into values/ + values-night/ achieves the same behavior using
+        the platform resource qualifier system.
+    -->
+    <style name="Theme.PinPin" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@color/pinpin_background</item>
+    </style>
+
+    <!--
+        Full-screen theme for the screen-capture activity (light variant).
+        We previously used a translucent theme; that interacted badly
+        with the system consent dialog on OneUI 8.5 (the dialog
+        dismissed the activity prematurely). Going full-screen gives
+        us a stable canvas for the region-selection UI and survives
+        the dialog transition.
+    -->
+    <style name="Theme.PinPin.Capture" parent="android:Theme.Material.Light.NoActionBar.Fullscreen">
+        <item name="android:windowBackground">@color/pinpin_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+    </style>
+
+</resources>

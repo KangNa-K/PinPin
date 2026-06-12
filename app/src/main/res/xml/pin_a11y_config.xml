@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Configuration for PinAccessibilityService.
+
+    What we need (and why):
+    - canRetrieveWindowContent=true  : required for any a11y service
+        that wants to receive accessibility events. Even though we
+        don't use these events for capture, the system requires this
+        flag set.
+    - accessibilityFlags=flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows
+        We listen to nothing in particular for v0.6, but reporting
+        view IDs and retrieving interactive windows is cheap and
+        leaves the door open for "auto-pick region under the ball"
+        UX without a manifest change later.
+    - accessibilityEventTypes : the typeWindowsChanged /
+        typeWindowStateChanged events let us detect when the user
+        has switched apps; we use this to dismiss the selection
+        overlay if they background our app mid-selection.
+    - packageNames=@null : listen to events from every app
+        (we'll filter in code if we ever need to).
+    - canTakeScreenshot=true : **CRITICAL** — without this the
+        AccessibilityServiceInfo does not gain
+        CAPABILITY_CAN_TAKE_SCREENSHOT, and AOSP 14+'s
+        AccessibilitySecurityPolicy.canTakeScreenshotLocked()
+        will throw SecurityException("Services don't have the
+        capability of taking the screenshot.") the moment we
+        call AccessibilityService.takeScreenshot(). This is
+        read from the XML attribute (NOT from the
+        <meta-data android:name="...canTakeScreenshot" .../>
+        in AndroidManifest.xml, which the system silently
+        ignores for this check). v0.6.0 through v0.6.8 all
+        had this wrong and crashed on every capture.
+
+    Note: this file mirrors the structure of fooView's
+    res/xml/phone_accessibility.xml. We intentionally keep the same
+    shape so future debugging can cross-reference.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/a11y_service_description"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged|typeViewClicked|typeViewTextChanged"
+    android:packageNames="@null"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:notificationTimeout="100"
+    android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true" />

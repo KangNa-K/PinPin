@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Pin window color tokens. All overlay windows (toolbar, close
+  button, passthrough exit button, drawing overlay) pull their
+  fill / stroke / icon colors from this file so that the entire
+  floating pin UI looks like one cohesive surface.
+
+  The colors switch automatically with the system theme (light /
+  dark) by reading `Configuration.UI_MODE_NIGHT_MASK` at runtime
+  and reapplying the values on every [PinWindowView.applyTheme].
+
+  浅色主题：
+    - 药丸 / 按钮背景：#CCFFFFFF（80% 白色）
+    - 描边：#33FFFFFF（20% 白色）
+    - 图标 / 文字：#1F1F23（深灰）
+
+  深色主题：
+    - 药丸 / 按钮背景：#CC1F1F23（80% 深色）
+    - 描边：#33FFFFFF（20% 白色）
+    - 图标 / 文字：#FFFFFF（白色）
+-->
+<resources>
+
+    <!--
+        App-level surface tokens (light variant). These are used by
+        themes.xml as the windowBackground / splash color, and by
+        the Compose theme for the home screen. The dark counterparts
+        live in values-night/colors.xml. The resource qualifier
+        system picks the right file based on the device's UI mode.
+    -->
+    <color name="pinpin_background">#F8F8FA</color>
+    <color name="pinpin_surface">#FFFFFF</color>
+    <color name="pinpin_on_surface">#1F1F23</color>
+
+    <!-- 浅色主题（悬浮 pin UI 表面） -->
+    <color name="pin_surface_fill_light">#CCFFFFFF</color>
+    <color name="pin_surface_stroke_light">#33FFFFFF</color>
+    <color name="pin_icon_color_light">#1F1F23</color>
+
+    <!-- 深色主题（悬浮 pin UI 表面） -->
+    <color name="pin_surface_fill_dark">#CC1F1F23</color>
+    <color name="pin_surface_stroke_dark">#33FFFFFF</color>
+    <color name="pin_icon_color_dark">#FFFFFF</color>
+
+    <!-- 锁定按钮激活态：保持 M3 error red，不受主题影响 -->
+    <color name="pin_lock_active_red">#D32F2F</color>
+
+    <!-- 锁定状态边框：保持红色提示 -->
+    <color name="pin_lock_indicator_red">#E53935</color>
+
+    <!-- 穿透状态边框：保持橙色提示 -->
+    <color name="pin_passthrough_indicator_orange">#80FF6F00</color>
+
+</resources>
+

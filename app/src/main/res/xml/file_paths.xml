@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Screenshot cache files written by PinAccessibilityService -->
+    <cache-path name="screenshots" path="screenshots/" />
+    <!-- General cache for annotated / exported images -->
+    <cache-path name="cache" path="." />
+    <!-- Internal storage files -->
+    <files-path name="files" path="." />
+</paths>

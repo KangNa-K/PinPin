@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Dark-theme splash / window background. Picked by the resource
+        system automatically when the device is in night mode (UiMode =
+        UI_MODE_NIGHT_YES), so the splash matches the Compose dark
+        palette in Color.kt. Light counterparts live in values/colors.xml.
+    -->
+    <color name="pinpin_background">#1C1C2E</color>
+    <color name="pinpin_surface">#2A2A3E</color>
+    <color name="pinpin_on_surface">#E8E8F0</color>
+</resources>

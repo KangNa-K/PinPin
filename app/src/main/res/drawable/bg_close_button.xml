@@ -1,0 +1,28 @@
+<!--
+    M3 Filled Tonal IconButton background — circular tonal surface.
+
+    M3 specifies:
+      Filled Tonal IconButton
+        container = secondaryContainer (light: #E8DEF8, dark: #4A4458)
+        icon       = onSecondaryContainer
+
+    The pin window is an overlay on top of arbitrary underlying apps
+    (the home screen, another app, a coloured wallpaper, …) so we
+    can't read the Activity's theme attributes from a drawable XML.
+    Instead we hard-code the dark-theme surfaceContainerHighest value
+    with a translucent alpha — this keeps the close button readable
+    on light backgrounds (where solid black would be jarring) AND on
+    dark backgrounds (where the tonal surface still has contrast).
+
+    The button size is fixed at 40dp (M3 IconButton's standard hit
+    area). The visible circle is the full 40dp — M3's IconButton has
+    no padding between hit-area and visual container, unlike
+    "standard" IconButton which uses 8dp padding.
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <solid android:color="#CC424750" />
+    <size
+        android:width="40dp"
+        android:height="40dp" />
+</shape>

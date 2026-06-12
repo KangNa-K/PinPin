@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+        Base app theme (dark variant — picked when the system IS in
+        night mode, i.e. Configuration.UI_MODE_NIGHT_YES). Parent is
+        android:Theme.Material.NoActionBar so inherited platform
+        defaults (text colors, ripples, ...) are dark. The light
+        counterpart lives in values/themes.xml.
+
+        This is the manual equivalent of using
+        Theme.AppCompat.DayNight.NoActionBar / similar — the resource
+        qualifier system picks the right variant at create time.
+    -->
+    <style name="Theme.PinPin" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@color/pinpin_background</item>
+    </style>
+
+    <style name="Theme.PinPin.Capture" parent="android:Theme.Material.NoActionBar.Fullscreen">
+        <item name="android:windowBackground">@color/pinpin_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+    </style>
+
+</resources>
