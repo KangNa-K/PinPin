@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <!-- Floating window permission: required to draw overlays on top of other apps. -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
@@ -12,22 +15,14 @@
     <!-- Notification permission: required on Android 13+ to show the foreground service notification. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!--
-        Accessibility service permission: required for the screen
-        capture path. We use AccessibilityService.takeScreenshot()
-        (Android 11+ / API 30) instead of MediaProjection — this
-        means no "share this screen" system dialog is ever shown to
-        the user, because the a11y permission is the only one we
-        ask for up front. This is the same approach fooView (FV 悬浮球)
-        uses to grab the screen.
-    -->
-    <uses-permission android:name="android.permission.BIND_ACCESSIBILITY_SERVICE" />
-
     <application
         android:name=".PinApplication"
         android:allowBackup="false"
-        android:icon="@android:drawable/sym_def_app_icon"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:icon="@drawable/ic_launcher_original"
         android:label="@string/app_name"
+        android:roundIcon="@drawable/ic_launcher_original"
         android:supportsRtl="true"
         android:theme="@style/Theme.PinPin">
 
@@ -115,18 +110,10 @@
             android:theme="@style/Theme.PinPin" />
 
         <!--
-            Accessibility service that owns the screen-capture path.
-            We use AccessibilityService.takeScreenshot() (Android 11+ /
-            API 30) to grab the screen — this is the trick fooView (FV
-            悬浮球) uses so the user never sees a "share this screen"
-            system dialog. The system only asks for the a11y permission
-            once, on the first launch.
-
-            canTakeScreenshot in the meta-data is what enables the
-            takeScreenshot() API call. canRetrieveWindowContent +
-            flagRetrieveInteractiveWindows give us window content
-            events that we'll ignore for now but keep for future
-            "auto-pick region under the ball" features.
+            Accessibility service that owns the screen-capture path. The
+            XML service configuration requests only the screenshot capability;
+            this app does not retrieve window content or inspect accessibility
+            events.
         -->
         <service
             android:name=".a11y.PinAccessibilityService"
@@ -139,14 +126,11 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/pin_a11y_config" />
-            <meta-data
-                android:name="android.accessibilityservice.canTakeScreenshot"
-                android:value="true" />
         </service>
 
         <!--
-            FileProvider for sharing pin images. Screenshots are
-            saved as file:// URIs in the cache directory; Android
+            FileProvider for sharing pin images. Pin assets are
+            saved as file:// URIs in private app storage; Android
             7.0+ forbids sharing file:// URIs with other apps.
             The provider converts them to content:// URIs that
             grant temporary read access to the target app.

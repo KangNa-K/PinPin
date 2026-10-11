@@ -1,5 +1,6 @@
 package com.pinpin.app.ball
 
+import androidx.core.graphics.toColorInt
 import android.annotation.SuppressLint
 import android.animation.ValueAnimator
 import android.content.Context
@@ -15,6 +16,7 @@ import android.graphics.Typeface
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.AttributeSet
 import android.util.Log
 import android.util.TypedValue
@@ -98,6 +100,12 @@ class BallView @JvmOverloads constructor(
     private var armRedirect: ((MotionEvent) -> Unit)? = null
     fun setArmRedirect(r: ((MotionEvent) -> Unit)?) { armRedirect = r }
 
+    /** True when the overlay deliberately keeps the gesture alive for precision editing. */
+    private var selectionGestureRetained: (() -> Boolean)? = null
+    fun setSelectionGestureRetained(check: (() -> Boolean)?) {
+        selectionGestureRetained = check
+    }
+
     /**
      * Optional tap callback. When the user releases the ball
      * without dragging, the ball normally snaps back to the
@@ -139,11 +147,11 @@ class BallView @JvmOverloads constructor(
 
     private val corePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.parseColor("#E67A1F2E") // deep slate red
+        color = "#E67A1F2E".toColorInt() // deep slate red
     }
     private val coreArmedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.parseColor("#F2C744") // FV-like yellow when armed
+        color = "#F2C744".toColorInt() // FV-like yellow when armed
     }
     private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -154,6 +162,16 @@ class BallView @JvmOverloads constructor(
         color = Color.WHITE
         strokeWidth = ringStrokePx
     }
+    private val armProgressPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = coreArmedPaint.color
+        strokeWidth = dp(3f)
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val armTracker = StationaryArmTracker(ARM_DELAY_MS, dp(ARM_MOVE_THRESHOLD_DP))
+    private val screenLocation = IntArray(2)
+    internal val selectionTouchX: Float get() = armX
+    internal val selectionTouchY: Float get() = armY
 
     // region Custom-image rendering
     //
@@ -187,7 +205,8 @@ class BallView @JvmOverloads constructor(
     private var imageLoadJob: Job? = null
 
     /** Coroutine scope for off-thread image decoding. Cancelled in onDetachedFromWindow. */
-    private val imageScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var imageScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var snapAnimator: ValueAnimator? = null
 
     /**
      * Set a custom image for the ball by [Uri] (typically a `content://`
@@ -199,6 +218,7 @@ class BallView @JvmOverloads constructor(
      * only renders what it's given.
      */
     fun setBallImageUri(uri: Uri?) {
+        imageLoadJob?.cancel()
         if (uri == null) {
             Log.d(TAG, "setBallImageUri(null) — reverting to default")
             setBallImageBitmap(null)
@@ -209,11 +229,16 @@ class BallView @JvmOverloads constructor(
         imageLoadJob?.cancel()
         val targetSide = (sizePx * 2).coerceAtLeast(1)  // 2× for anti-alias headroom
         imageLoadJob = imageScope.launch {
-            val bmp = withContext(Dispatchers.IO) {
-                decodeSampledBitmap(context, uri, targetSide)
+            var decoded: Bitmap? = null
+            try {
+                withContext(Dispatchers.IO) {
+                    decoded = decodeSampledBitmap(context, uri, targetSide)
+                }
+                setBallImageBitmap(decoded)
+                decoded = null
+            } finally {
+                decoded?.recycle()
             }
-            Log.d(TAG, "decode finished: ${if (bmp == null) "null" else "${bmp.width}x${bmp.height}"}")
-            setBallImageBitmap(bmp)
         }
     }
 
@@ -229,6 +254,8 @@ class BallView @JvmOverloads constructor(
         // the bitmap here — callers may still hold it elsewhere; we
         // recycle in onDetachedFromWindow to cover the common case).
         avatarShader = null
+        avatarPaint.shader = null
+        if (avatarBitmap !== bitmap) avatarBitmap?.let { if (!it.isRecycled) it.recycle() }
         avatarBitmap = bitmap
         if (bitmap != null) {
             avatarShader = BitmapShader(bitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
@@ -252,8 +279,8 @@ class BallView @JvmOverloads constructor(
     fun setAvatarTransform(scale: Float, offsetX: Float, offsetY: Float) {
         val s = if (scale.isFinite() && scale > 0f) scale else 1f
         avatarScale = s
-        avatarOffsetX = offsetX
-        avatarOffsetY = offsetY
+        avatarOffsetX = if (offsetX.isFinite()) offsetX else 0f
+        avatarOffsetY = if (offsetY.isFinite()) offsetY else 0f
         invalidate()
     }
 
@@ -306,6 +333,9 @@ class BallView @JvmOverloads constructor(
         } catch (e: Exception) {
             Log.e(TAG, "decodeSampledBitmap failed for $uri", e)
             null
+        } catch (e: OutOfMemoryError) {
+            Log.w(TAG, "Ball image too large", e)
+            null
         }
     }
     // endregion
@@ -313,20 +343,7 @@ class BallView @JvmOverloads constructor(
     private val handler = Handler(Looper.getMainLooper())
     private val armRunnable: Runnable = Runnable {
         if (state == State.DRAGGING) {
-            // Check if the finger has actually stopped since the
-            // timer was started. Android sends ACTION_MOVE even
-            // when the finger is still (touch sensor jitter), so
-            // we compare the current position against where it was
-            // when the timer was (re)started. If the finger has
-            // moved significantly, it's still dragging — restart
-            // the timer. Otherwise, arm.
-            val dx: Int = armX - armTimerX
-            val dy: Int = armY - armTimerY
-            val distanceSq: Int = dx * dx + dy * dy
-            if (distanceSq > armMoveThresholdSq) {
-                Log.d(TAG, "armRunnable: finger still moving (dx=$dx, dy=$dy), restarting timer")
-                armTimerX = armX
-                armTimerY = armY
+            if (armTracker.remainingMs(SystemClock.uptimeMillis()) > 0) {
                 restartArmTimer()
             } else {
                 // Report the ball's visual center as the rect origin,
@@ -338,30 +355,38 @@ class BallView @JvmOverloads constructor(
                 // be on the hit area instead of where they see the
                 // ball, leaving a visible offset between the ball and
                 // the rect origin.
-                val lp = attachedParams
-                val centerX: Int = (lp?.x ?: armX) + width / 2
-                val centerY: Int = (lp?.y ?: armY) + height / 2
-                Log.d(TAG, "armRunnable: finger stopped — transitioning to ARMED at ball center ($centerX, $centerY)")
-                state = State.ARMED
+                getLocationOnScreen(screenLocation)
+                val centerX = screenLocation[0] + width / 2
+                val centerY = screenLocation[1] + height / 2
+                Log.d(TAG, "armRunnable: finger stopped — arming at ball center ($centerX, $centerY)")
                 isEnabled = false
-                host?.onArm(centerX, centerY)
-                invalidate()
+                // Let the host call enterSelecting() which sets
+                // state = SELECTING directly — this avoids a one-frame
+                // flash of the ARMED (yellow-ring) state that causes
+                // the selection rect to visually "jump".
+                val host = host
+                if (host != null) {
+                    host.onArm(centerX, centerY)
+                } else {
+                    // No host — fall back to ARMED so the state
+                    // machine still works for ACTION_UP handling.
+                    state = State.ARMED
+                    invalidate()
+                }
             }
         }
     }
 
     private fun restartArmTimer() {
         handler.removeCallbacks(armRunnable)
-        handler.postDelayed(armRunnable, ARM_DELAY_MS)
+        handler.postDelayed(armRunnable, armTracker.remainingMs(SystemClock.uptimeMillis()))
+        postInvalidateOnAnimation()
     }
 
     /** Position where the finger was last seen, captured when the arm timer fires. */
-    private var armX = 0
-    private var armY = 0
-
-    /** Position when the arm timer was last (re)started; used to detect real movement vs jitter. */
-    private var armTimerX = 0
-    private var armTimerY = 0
+    private var armX = 0f
+    private var armY = 0f
+    private var ignoreUntilNextDown = false
 
     private var dragStartRawX = 0f
     private var dragStartRawY = 0f
@@ -371,23 +396,16 @@ class BallView @JvmOverloads constructor(
 
     private var attachEdge: Int = EDGE_RIGHT  // which screen edge we're stuck to
 
-    /** Squared pixel threshold for "finger has moved significantly". Computed in init from dp. */
-    private var armMoveThresholdSq: Int = 0
-
     init {
-        // The ball itself is a fixed-size circle inside a FrameLayout; the
-        // FrameLayout provides the touchable hit area so the user has
-        // some slop around the visual circle.
-        layoutParams = LayoutParams(sizePx + dp(20f).toInt(), sizePx + dp(20f).toInt())
-        minimumWidth = sizePx + dp(20f).toInt()
-        minimumHeight = sizePx + dp(20f).toInt()
+        // Keep only 2dp of tolerance on each side of the visible ball.
+        val hitSize = sizePx + dp(4f).toInt()
+        layoutParams = LayoutParams(hitSize, hitSize)
+        minimumWidth = hitSize
+        minimumHeight = hitSize
 
         setWillNotDraw(false)
         isClickable = true
         isFocusable = true
-
-        val thresholdPx = dp(ARM_MOVE_THRESHOLD_DP)
-        armMoveThresholdSq = (thresholdPx * thresholdPx).toInt()
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -445,6 +463,7 @@ class BallView @JvmOverloads constructor(
                 Color.WHITE
             }
             canvas.drawCircle(cx, cy, side, imageRingPaint)
+            drawArmProgress(canvas, cx, cy)
             // Also overlay the zOrder badge so the user can tell
             // which pin this ball represents. The badge is drawn
             // AFTER the ring so it sits on top of the avatar.
@@ -471,6 +490,7 @@ class BallView @JvmOverloads constructor(
 
         // Core: always red — the ball's identity colour.
         canvas.drawCircle(cx, cy, r, corePaint)
+        drawArmProgress(canvas, cx, cy)
 
         // Tiny crosshair on the ball — visual hint to the user
         // that the ball is the "selector origin". We always draw it
@@ -490,7 +510,7 @@ class BallView @JvmOverloads constructor(
 
     private val badgeFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.parseColor("#E53935") // M3 error red
+        color = "#E53935".toColorInt() // M3 error red
     }
     private val badgeStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -526,9 +546,35 @@ class BallView @JvmOverloads constructor(
         canvas.drawText(text, cx, baseline, badgeTextPaint)
     }
 
+    private fun drawArmProgress(canvas: Canvas, cx: Float, cy: Float) {
+        if (state != State.DRAGGING || host == null) return
+        val radius = coreRadiusPx + ringStrokePx + dp(3f)
+        val progress = armTracker.progress(SystemClock.uptimeMillis())
+        canvas.drawArc(cx - radius, cy - radius, cx + radius, cy + radius,
+            -90f, 360f * progress, false, armProgressPaint)
+        if (progress < 1f) postInvalidateOnAnimation()
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val lp = attachedParams ?: return false
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) ignoreUntilNextDown = false
+        if (ignoreUntilNextDown) return true
+        if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
+            ignoreUntilNextDown = true
+            pendingSelectRect = null
+            host?.onCancel()
+            resetToIdle()
+            return true
+        }
+        if (event.actionMasked == MotionEvent.ACTION_CANCEL) {
+            handler.removeCallbacks(armRunnable)
+            armTracker.cancel()
+            pendingSelectRect = null
+            host?.onCancel()
+            resetToIdle()
+            return true
+        }
         // Once we've armed, Android keeps dispatching subsequent
         // touches to *this* view (the one that received the first
         // ACTION_DOWN) — it does not automatically reroute them to
@@ -537,21 +583,21 @@ class BallView @JvmOverloads constructor(
         // stuck mid-selection forever and the gesture is silently
         // dropped on ACTION_UP.
         //
-        // We *also* keep moving the ball view itself while the
-        // user is in ARMED/SELECTING — otherwise the ball feels
-        // frozen the moment it turns yellow, even though the
-        // overlay is happily extending the rubber band. The user
-        // expects the ball to keep tracking the finger because
-        // the ball *is* the selection-origin marker.
+        // The overlay draws the selection cursor. Keep this input window
+        // stationary so each touch sample does not trigger a window IPC.
         if (state == State.ARMED || state == State.SELECTING) {
-            if (event.actionMasked == MotionEvent.ACTION_MOVE) {
-                moveBallWithFinger(event, lp)
-            }
             armRedirect?.invoke(event)
+            if (state == State.SELECTING &&
+                event.actionMasked == MotionEvent.ACTION_UP &&
+                selectionGestureRetained?.invoke() == true
+            ) {
+                return true
+            }
             return true
         }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                snapAnimator?.cancel()
                 Log.d(TAG, "ACTION_DOWN at raw=(${event.rawX}, ${event.rawY}) isEnabled=$isEnabled clickable=$isClickable")
                 dragStartRawX = event.rawX
                 dragStartRawY = event.rawY
@@ -563,14 +609,11 @@ class BallView @JvmOverloads constructor(
                 // arm timer has a sensible fallback if the user
                 // never moves (a tap-drag-stop pattern); the MOVE
                 // branch updates them in real time.
-                armX = event.rawX.toInt()
-                armY = event.rawY.toInt()
-                armTimerX = armX
-                armTimerY = armY
+                armX = event.rawX
+                armY = event.rawY
+                armTracker.start(armX, armY, SystemClock.uptimeMillis())
                 state = State.DRAGGING
-                // Start arm timer. When it fires, it checks whether
-                // the finger has actually stopped; if still moving,
-                // it restarts itself.
+                // Every movement outside the jitter tolerance renews this deadline.
                 restartArmTimer()
                 return true
             }
@@ -578,15 +621,14 @@ class BallView @JvmOverloads constructor(
                 val rawX = event.rawX
                 val rawY = event.rawY
                 moveBallWithFinger(event, lp)
-                // Keep armX/armY at the *current* finger position
-                // so the arm timer can check if the finger has
-                // actually stopped when it fires.
-                armX = rawX.toInt()
-                armY = rawY.toInt()
+                armX = rawX
+                armY = rawY
+                if (armTracker.move(rawX, rawY, SystemClock.uptimeMillis())) restartArmTimer()
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 handler.removeCallbacks(armRunnable)
+                armTracker.cancel()
                 when (state) {
                     State.DRAGGING -> {
                         // Released without ever arming. Two cases:
@@ -652,6 +694,7 @@ class BallView @JvmOverloads constructor(
     internal var pendingSelectRect: android.graphics.Rect? = null
 
     fun enterSelecting() {
+        armTracker.cancel()
         state = State.SELECTING
         // Belt-and-suspenders: even though the selection overlay
         // sits above us in z-order and now (post-fix) consumes
@@ -667,6 +710,8 @@ class BallView @JvmOverloads constructor(
 
     fun resetToIdle() {
         handler.removeCallbacks(armRunnable)
+        armTracker.cancel()
+        alpha = 1f
         state = State.IDLE
         isEnabled = true
         isClickable = true
@@ -683,6 +728,9 @@ class BallView @JvmOverloads constructor(
     }
 
     override fun onDetachedFromWindow() {
+        snapAnimator?.cancel()
+        handler.removeCallbacks(armRunnable)
+        armTracker.cancel()
         // Cancel any pending image decode and recycle the bitmap we
         // own. We only recycle the bitmap that came from
         // setBallImageBitmap (where we documented ownership transfer);
@@ -697,11 +745,16 @@ class BallView @JvmOverloads constructor(
         super.onDetachedFromWindow()
     }
 
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (imageScope.coroutineContext[Job]?.isActive != true) {
+            imageScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+        }
+    }
+
     /**
      * Move the ball view itself to follow the user's finger.
-     * Shared between the DRAGGING state and the post-armed
-     * ARMED/SELECTING states so the ball tracks the finger for
-     * the entire gesture, not just until the 0.7s arm deadline.
+     * During selection the overlay cursor takes over without moving this window.
      */
     private fun moveBallWithFinger(event: MotionEvent, lp: WindowManager.LayoutParams) {
         val rawX = event.rawX
@@ -716,14 +769,15 @@ class BallView @JvmOverloads constructor(
         if (!hasDragged) return
         val newX = (dragStartParamX + dx).toInt()
         val newY = (dragStartParamY + dy).toInt()
+        if (lp.x == newX && lp.y == newY) return
         lp.x = newX
         lp.y = newY
         runCatching { windowManager.updateViewLayout(this, lp) }
         // Keep armX/armY in sync so that if the user releases
         // the finger without further moves, the rect origin is
         // wherever the ball *is*, not where it was at arm time.
-        armX = rawX.toInt()
-        armY = rawY.toInt()
+        armX = rawX
+        armY = rawY
     }
 
     /**
@@ -735,6 +789,7 @@ class BallView @JvmOverloads constructor(
      * branch.
      */
     fun snapToEdge(lp: WindowManager.LayoutParams) {
+        snapAnimator?.cancel()
         val centerX = lp.x + width / 2
         val centerY = lp.y + height / 2
         val w = attachedDisplayWidth
@@ -745,16 +800,17 @@ class BallView @JvmOverloads constructor(
         } else {
             (w - width - edgeMarginPx) to EDGE_RIGHT
         }
-        val targetY = (lp.y).coerceIn(edgeMarginPx, h - height - edgeMarginPx)
+        val targetY = lp.y.coerceIn(0, (h - height - edgeMarginPx).coerceAtLeast(0))
         attachEdge = edge
-        ValueAnimator.ofInt(lp.x, targetX).apply {
+        snapAnimator = ValueAnimator.ofInt(lp.x, targetX.coerceIn(0, (w - width).coerceAtLeast(0))).apply {
             duration = 220
             interpolator = OvershootInterpolator(1.5f)
             addUpdateListener {
                 lp.x = it.animatedValue as Int
                 runCatching { windowManager.updateViewLayout(this@BallView, lp) }
             }
-        }.start()
+            start()
+        }
         if (lp.y != targetY) {
             lp.y = targetY
             runCatching { windowManager.updateViewLayout(this, lp) }

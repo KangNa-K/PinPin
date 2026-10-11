@@ -4,6 +4,10 @@ import android.app.Application
 import com.pinpin.app.data.PinRepository
 import dagger.hilt.android.HiltAndroidApp
 import javax.inject.Inject
+import com.pinpin.app.update.AppUpdateController
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 
 /**
  * Application entry point.
@@ -19,6 +23,10 @@ import javax.inject.Inject
  */
 @HiltAndroidApp
 class PinApplication : Application() {
+
+    val appUpdateController by lazy {
+        AppUpdateController(this, CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate))
+    }
 
     @Inject lateinit var pinRepository: PinRepository
 

@@ -8,31 +8,29 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import android.os.Handler
-import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.WindowManager
+import androidx.core.content.edit
+import com.pinpin.app.capture.registerCaptureReceiver
+import com.pinpin.app.capture.CaptureProtocol as Protocol
 import androidx.core.app.NotificationCompat
+import androidx.core.content.FileProvider
 import com.pinpin.app.R
 import com.pinpin.app.a11y.PinAccessibilityService
-import com.pinpin.app.data.PinRepository
 import com.pinpin.app.overlay.PinOverlayService
 import com.pinpin.app.ui.MainActivity
 import dagger.hilt.android.AndroidEntryPoint
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
-import javax.inject.Inject
 
 /**
  * Owns the persistent floating "ball" and the transient full-screen
@@ -62,8 +60,6 @@ import javax.inject.Inject
 @AndroidEntryPoint
 class BallService : Service() {
 
-    @Inject lateinit var pinRepository: PinRepository
-
     private val windowManager: WindowManager by lazy {
         getSystemService(Context.WINDOW_SERVICE) as WindowManager
     }
@@ -72,38 +68,103 @@ class BallService : Service() {
         BallView(this).also { it.setHost(ballHost) }
     }
 
-    private val captureThread by lazy { HandlerThread("ball-capture").apply { start() } }
-    private val captureHandler by lazy { Handler(captureThread.looper) }
-    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val captureHandler = Handler(android.os.Looper.getMainLooper())
+    private var pendingCapture: String? = null
+    private var pendingAction: String = Protocol.ACTION_PIN
+    private var savingCapture: String? = null
+    private var hiddenForCapture: String? = null
+    private var previousBallVisibility = android.view.View.VISIBLE
+    private var captureStartedAt = 0L
+    private var captureToast: android.widget.Toast? = null
+    private val slowCaptureFeedback = Runnable {
+        if (pendingCapture != null && savingCapture != null) {
+            showCaptureMessage("截图已完成，正在保存", false)
+        }
+    }
+    private val captureTimeout = Runnable {
+        pendingCapture?.let { id ->
+            if (savingCapture == id) return@let
+            runCatching { sendBroadcast(Intent(Protocol.CANCEL).setPackage(packageName).putExtra(Protocol.ID, id)) }
+            if (hiddenForCapture == id) {
+                runCatching { PinOverlayService.setAllPinsVisible(this, true) }
+            }
+            restoreCaptureBall(id)
+            // A missing SAVING/RESULT broadcast cannot prove that no commit occurred.
+            // Keep the request ID so a delayed saving/commit receipt can still reconcile it.
+            if (!PinAccessibilityService.hasPendingRequest(id)) {
+                completeCapture(id, false, "status_unknown")
+            } else {
+                showCaptureMessage("截图状态未确认，正在等待服务回执", true)
+            }
+        }
+    }
 
     private var ballAttached = false
     private var overlayView: SelectionOverlayView? = null
     private var overlayAttached = false
+    private var selectionWindowManager: WindowManager? = null
 
     private val hideOverlayReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: android.content.Context, intent: android.content.Intent) {
-            if (intent.action != ACTION_HIDE_OVERLAY) return
-            Log.d(TAG, "HIDE_OVERLAY broadcast received — tearing down overlay so a11y screencap is clean")
-            // Synchronously remove the overlay view. WindowManager
-            // itself completes the IPC synchronously, but the
-            // SurfaceFlinger side takes a few frames to actually
-            // drop the layer — the a11y side waits another 250ms
-            // before calling takeScreenshot() so that race never
-            // matters.
-            detachOverlay()
+            val id = runCatching { intent.getStringExtra(Protocol.ID) }.getOrNull()
+                ?.takeIf(Protocol::validId) ?: return
+            if (id != pendingCapture) return
+            when (intent.action) {
+                Protocol.HIDE -> {
+                    if (savingCapture == id) return
+                    if (hiddenForCapture == null) {
+                        hiddenForCapture = id
+                        previousBallVisibility = ballView.visibility
+                        ballView.visibility = android.view.View.INVISIBLE
+                    }
+                    try {
+                        check(detachOverlay()) { "Selection window did not detach" }
+                        ballView.postOnAnimation {
+                            ballView.postOnAnimation {
+                                if (pendingCapture == id && hiddenForCapture == id) {
+                                    runCatching {
+                                        sendBroadcast(Intent(Protocol.HIDDEN).setPackage(packageName)
+                                            .putExtra(Protocol.ID, id))
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        runCatching { sendBroadcast(Intent(Protocol.CANCEL).setPackage(packageName).putExtra(Protocol.ID, id)) }
+                        runCatching { PinOverlayService.setAllPinsVisible(this@BallService, true) }
+                        completeCapture(id, false, "hide_failed")
+                    }
+                }
+                Protocol.RESTORE -> restoreCaptureBall(id)
+                Protocol.SAVING -> {
+                    captureHandler.removeCallbacks(captureTimeout)
+                    restoreCaptureBall(id)
+                    if (savingCapture != id) {
+                        savingCapture = id
+                        if (SystemClock.elapsedRealtime() - captureStartedAt >= 1_000L) {
+                            showCaptureMessage("截图已完成，正在保存", false)
+                        }
+                    }
+                }
+                Protocol.RESULT -> {
+                    if (!intent.hasExtra(Protocol.SUCCESS)) return
+                    completeCapture(id, intent.getBooleanExtra(Protocol.SUCCESS, false),
+                        intent.getStringExtra(Protocol.ERROR),
+                        intent.getStringExtra(Protocol.HISTORY_PATH))
+                }
+            }
         }
     }
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        val filter = android.content.IntentFilter(ACTION_HIDE_OVERLAY)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(hideOverlayReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(hideOverlayReceiver, filter)
+        val filter = android.content.IntentFilter(Protocol.HIDE).apply {
+            addAction(Protocol.RESTORE)
+            addAction(Protocol.RESULT)
+            addAction(Protocol.SAVING)
         }
+        registerCaptureReceiver(this, hideOverlayReceiver, filter)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -146,11 +207,16 @@ class BallService : Service() {
     }
 
     override fun onDestroy() {
+        pendingCapture?.let { id ->
+            runCatching { sendBroadcast(Intent(Protocol.CANCEL).setPackage(packageName).putExtra(Protocol.ID, id)) }
+            if (hiddenForCapture == id) runCatching { PinOverlayService.setAllPinsVisible(this, true) }
+            restoreCaptureBall(id)
+        }
+        captureHandler.removeCallbacksAndMessages(null)
+        captureToast?.cancel()
         detachOverlay()
         if (ballAttached) runCatching { windowManager.removeView(ballView) }
         ballAttached = false
-        scope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
-        captureThread.quitSafely()
         runCatching { unregisterReceiver(hideOverlayReceiver) }
         super.onDestroy()
     }
@@ -204,6 +270,9 @@ class BallService : Service() {
             // used to live here; we keep this comment so the next
             // person doesn't reintroduce it.
             overlayView?.onTouchEvent(event)
+        }
+        ballView.setSelectionGestureRetained {
+            overlayView?.isPrecisionAdjusting == true
         }
         // Quick tap on the ball (down + up before the
         // 1.5s arm timer fires) launches the host app so the
@@ -284,12 +353,12 @@ class BallService : Service() {
     private fun readBallImagePref(): Uri? =
         ballPrefs().getString(KEY_BALL_IMAGE_URI, null)?.let(Uri::parse)
     private fun writeBallImagePref(uri: Uri, scale: Float, offsetX: Float, offsetY: Float) {
-        ballPrefs().edit()
-            .putString(KEY_BALL_IMAGE_URI, uri.toString())
-            .putFloat(KEY_BALL_IMAGE_SCALE, scale)
-            .putFloat(KEY_BALL_IMAGE_OFFSET_X, offsetX)
-            .putFloat(KEY_BALL_IMAGE_OFFSET_Y, offsetY)
-            .apply()
+        ballPrefs().edit {
+            putString(KEY_BALL_IMAGE_URI, uri.toString())
+            putFloat(KEY_BALL_IMAGE_SCALE, scale)
+            putFloat(KEY_BALL_IMAGE_OFFSET_X, offsetX)
+            putFloat(KEY_BALL_IMAGE_OFFSET_Y, offsetY)
+        }
     }
     private fun readBallImageTransformPref(): Triple<Float, Float, Float> {
         val prefs = ballPrefs()
@@ -300,25 +369,33 @@ class BallService : Service() {
         )
     }
     private fun clearBallImagePref() {
-        ballPrefs().edit()
-            .remove(KEY_BALL_IMAGE_URI)
-            .remove(KEY_BALL_IMAGE_SCALE)
-            .remove(KEY_BALL_IMAGE_OFFSET_X)
-            .remove(KEY_BALL_IMAGE_OFFSET_Y)
-            .apply()
+        ballPrefs().edit {
+            remove(KEY_BALL_IMAGE_URI)
+            remove(KEY_BALL_IMAGE_SCALE)
+            remove(KEY_BALL_IMAGE_OFFSET_X)
+            remove(KEY_BALL_IMAGE_OFFSET_Y)
+        }
     }
 
-    private fun attachOverlay(originX: Int, originY: Int) {
-        if (overlayAttached) return
+    private fun attachOverlay(originX: Int, originY: Int): Boolean {
+        if (overlayAttached) return true
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
         windowManager.defaultDisplay.getRealMetrics(metrics)
-        val view = SelectionOverlayView(this).apply {
+        val accessibilityService = PinAccessibilityService.current()
+        // Accessibility overlays sit above system bars; application overlays do not.
+        val overlayContext = accessibilityService ?: this
+        val manager = overlayContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val view = SelectionOverlayView(overlayContext).apply {
             listener = overlayListener
+            precisionEnabled = true
         }
-        val lp = view.layoutParamsForScreen(metrics.widthPixels, metrics.heightPixels)
-        runCatching { windowManager.addView(view, lp) }
+        val type = if (accessibilityService != null) WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+            else WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        val lp = view.layoutParamsForScreen(metrics.widthPixels, metrics.heightPixels, type)
+        return runCatching { manager.addView(view, lp) }
             .onSuccess {
+                selectionWindowManager = manager
                 overlayView = view
                 overlayAttached = true
                 Log.d(TAG, "overlay attached at ($originX, $originY)")
@@ -329,42 +406,52 @@ class BallService : Service() {
                 // ACTION_DOWN. By forceArming, the very next
                 // ACTION_MOVE (forwarded from the ball) extends the
                 // rect, and ACTION_UP confirms it.
-                view.forceArm(originX.toFloat(), originY.toFloat())
+                view.forceArm(originX.toFloat(), originY.toFloat(),
+                    ballView.selectionTouchX, ballView.selectionTouchY)
             }
-            .onFailure { Log.e(TAG, "addView(overlay) failed", it) }
+            .onFailure { Log.e(TAG, "addView(overlay) failed", it) }.isSuccess
     }
 
-    private fun detachOverlay() {
-        if (!overlayAttached) return
-        overlayView?.let { runCatching { windowManager.removeView(it) } }
+    private fun detachOverlay(): Boolean {
+        if (!overlayAttached) return true
+        overlayView?.let {
+            try {
+                checkNotNull(selectionWindowManager).removeViewImmediate(it)
+            } catch (e: Exception) {
+                Log.w(TAG, "Selection window removal failed", e)
+                return false
+            }
+        }
         overlayView = null
         overlayAttached = false
+        selectionWindowManager = null
+        return true
     }
 
     private val ballHost: BallView.Host = object : BallView.Host {
         override fun onArm(originX: Int, originY: Int) {
+            if (pendingCapture != null) {
+                ballView.resetToIdle()
+                return
+            }
             Log.d(TAG, "ball.onArm at ($originX, $originY) — bringing up selection overlay")
-            // Spec: 0.7s of "ball pressed" turns the ball yellow and
-            // pops up a full-screen selection overlay at the armed
-            // point. The user then extends the rect by moving their
-            // finger; the overlay reports a final Rect on ACTION_UP
-            // via onSelectDone. From this point the ball view's
-            // ARMED/SELECTING branch is forwarding every subsequent
-            // touch event to the overlay (see
-            // BallView.onTouchEvent's armRedirect) — we just need
-            // to flip the ball into SELECTING and let the overlay
-            // own the rest of the gesture.
-            attachOverlay(originX, originY)
+            // Keep the original input target alive; the overlay renders the cursor.
+            if (!attachOverlay(originX, originY)) {
+                ballView.resetToIdle()
+                return
+            }
+            ballView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
             ballView.enterSelecting()
+            // Alpha keeps the current input stream alive while the overlay draws its cursor.
+            ballView.alpha = 0f
         }
 
         override fun onSelectDone(rectInScreen: Rect) {
             Log.d(TAG, "ball.onSelectDone $rectInScreen")
             detachOverlay()
             ballView.resetToIdle()
-            // Run capture on a background thread so we don't block the
-            // ball's touch event loop.
-            captureHandler.post { runCapture(rectInScreen) }
+            // Only send the request here; screenshot processing remains off-thread.
+            runCapture(rectInScreen)
         }
 
         override fun onCancel() {
@@ -378,12 +465,30 @@ class BallService : Service() {
         override fun onConfirm(rect: Rect) {
             ballHost.onSelectDone(rect)
         }
+        override fun onAction(rect: Rect, action: SelectionOverlayView.Action) {
+            val captureAction = when (action) {
+                SelectionOverlayView.Action.ANNOTATE -> Protocol.ACTION_ANNOTATE
+                SelectionOverlayView.Action.PIN -> Protocol.ACTION_PIN
+                SelectionOverlayView.Action.COPY -> Protocol.ACTION_COPY
+                SelectionOverlayView.Action.SHARE -> Protocol.ACTION_SHARE
+                SelectionOverlayView.Action.SAVE -> Protocol.ACTION_SAVE
+            }
+            // The action toolbar can finish the selection directly, so it
+            // does not pass through onSelectDone(). Restore the ball and
+            // remove the full-screen overlay before capture starts.
+            // Otherwise the ball remains alpha=0 from onArm() and the
+            // capture restore only brings back its visibility, leaving it
+            // apparently missing after a pin action.
+            detachOverlay()
+            ballView.resetToIdle()
+            runCapture(rect, captureAction)
+        }
         override fun onCancel() {
             ballHost.onCancel()
         }
     }
 
-    private fun runCapture(rect: Rect) {
+    private fun runCapture(rect: Rect, action: String = Protocol.ACTION_PIN) {
         // The a11y service does the actual takeScreenshot() — we can't
         // do it from here because Android 14+ throws
         // SecurityException("Services don't have the capability of
@@ -394,53 +499,129 @@ class BallService : Service() {
         // rect, writes the cache, and inserts the pin.
         Log.d(TAG, "runCapture broadcasting CAPTURE_SCREENSHOT with rect=$rect")
 
-        // Snapshot the pin count BEFORE the broadcast. We use this
-        // 2 seconds later to detect the case where the broadcast
-        // was silently dropped — most commonly because the a11y
-        // service process has been killed (system marks it
-        // "Crashed" after that and won't deliver any further
-        // broadcasts until the user re-enables it from Settings →
-        // Accessibility). Without this check, the user's selection
-        // gesture simply disappears into the void and they get
-        // no feedback that something went wrong.
-        val pinCountBefore = pinRepository.pinsState.value.size
+        if (pendingCapture != null) return
+        if (rect.isEmpty || rect.left < 0 || rect.top < 0) return
+        val requestId = java.util.UUID.randomUUID().toString()
+        pendingCapture = requestId
+        pendingAction = action
+        captureToast?.cancel()
+        captureStartedAt = SystemClock.elapsedRealtime()
+        captureHandler.postDelayed(slowCaptureFeedback, 1_000L)
+        captureHandler.postDelayed(captureTimeout, Protocol.TIMEOUT_MS + 2_000)
 
-        captureHandler.post {
+        try {
             val intent = android.content.Intent(
                 PinAccessibilityService.ACTION_CAPTURE_SCREENSHOT,
             ).apply {
                 setPackage(packageName)
+                putExtra(Protocol.ID, requestId)
+                putExtra(Protocol.ACTION, action)
                 putExtra(PinAccessibilityService.EXTRA_RECT_LEFT, rect.left)
                 putExtra(PinAccessibilityService.EXTRA_RECT_TOP, rect.top)
                 putExtra(PinAccessibilityService.EXTRA_RECT_RIGHT, rect.right)
                 putExtra(PinAccessibilityService.EXTRA_RECT_BOTTOM, rect.bottom)
             }
             sendBroadcast(intent)
+        } catch (e: Exception) {
+            completeCapture(requestId, false, "request_failed")
         }
+    }
 
-        // After a generous delay, verify the a11y service actually
-        // received the broadcast and inserted a new pin. If not,
-        // surface an actionable Toast so the user knows to
-        // re-enable the a11y service in Settings (the most common
-        // reason a previously-working capture stops is the system
-        // killing the a11y service process for memory pressure).
-        captureHandler.postDelayed({
-            val pinCountAfter = pinRepository.pinsState.value.size
-            if (pinCountAfter <= pinCountBefore) {
-                Log.w(
-                    TAG,
-                    "runCapture: a11y service did not respond within 2s " +
-                        "(pin count unchanged at $pinCountBefore). " +
-                        "The a11y service process is likely killed — " +
-                        "ask the user to re-enable it in Settings.",
-                )
-                android.widget.Toast.makeText(
-                    this,
-                    "无障碍服务未响应。请到 设置 → 辅助功能 → 钉图，关闭再打开一次以恢复截图功能",
-                    android.widget.Toast.LENGTH_LONG,
-                ).show()
+    private fun restoreCaptureBall(id: String) {
+        if (hiddenForCapture != id) return
+        hiddenForCapture = null
+        if (ballAttached) ballView.visibility = previousBallVisibility
+    }
+
+    private fun completeCapture(id: String, success: Boolean, error: String?, historyPath: String? = null) {
+        if (pendingCapture != id) return
+        captureHandler.removeCallbacks(captureTimeout)
+        captureHandler.removeCallbacks(slowCaptureFeedback)
+        captureToast?.cancel()
+        restoreCaptureBall(id)
+        val action = pendingAction
+        pendingCapture = null
+        pendingAction = Protocol.ACTION_PIN
+        savingCapture = null
+        if (com.pinpin.app.BuildConfig.DEBUG) Log.d("CaptureTiming",
+            "id=$id ball_receipt=${SystemClock.elapsedRealtime() - captureStartedAt}ms success=$success")
+        if (!success) {
+            Log.w(TAG, "Capture $id failed: $error")
+            val message = when (error) {
+                "status_unknown" -> "截图状态未确认，请检查历史记录；若没有新图，请重新启用截图服务后重试"
+                "busy" -> "上一张截图仍在处理，请稍后再试"
+                "timeout" -> "截图等待超时，请重试"
+                "processing_failed", "saving_failed" -> "图片保存未完成，请检查历史记录和存储空间"
+                "screenshot_${android.accessibilityservice.AccessibilityService.ERROR_TAKE_SCREENSHOT_SECURE_WINDOW}" ->
+                    "当前页面禁止截图"
+                "screenshot_${android.accessibilityservice.AccessibilityService.ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT}" ->
+                    "截图操作过于频繁，请稍后重试"
+                "cancelled", "interrupted" -> "截图已取消"
+                else -> "截图未完成，请检查截图权限后重试 ($error)"
             }
-        }, 2000L)
+            showCaptureMessage(message, true)
+        } else if (historyPath != null) {
+            performCaptureAction(action, historyPath)
+        }
+    }
+
+    private fun performCaptureAction(action: String, rawPath: String) {
+        val historyRoot = java.io.File(filesDir.canonicalFile, "screenshot_history").canonicalFile
+        val file = runCatching { java.io.File(rawPath).canonicalFile }.getOrNull()
+            ?.takeIf { it.parentFile == historyRoot && it.isFile } ?: return
+        when (action) {
+            Protocol.ACTION_COPY -> {
+                val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                clipboard.setPrimaryClip(android.content.ClipData.newRawUri("PinPin screenshot", uri))
+                showCaptureMessage("已复制截图", false)
+            }
+            Protocol.ACTION_SHARE -> {
+                val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = "image/png"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    clipData = android.content.ClipData.newRawUri("PinPin screenshot", uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                startActivity(Intent.createChooser(send, "分享截图")
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }
+            Protocol.ACTION_SAVE -> {
+                runCatching {
+                    val values = android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.Images.Media.DISPLAY_NAME,
+                            "pinpin-${System.currentTimeMillis()}.png")
+                        put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/png")
+                        put(android.provider.MediaStore.Images.Media.IS_PENDING, 1)
+                        put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/pinpin")
+                    }
+                    val destination = contentResolver.insert(
+                        android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values
+                    ) ?: error("Could not create gallery entry")
+                    try {
+                        contentResolver.openOutputStream(destination)?.use { output ->
+                            file.inputStream().use { it.copyTo(output) }
+                        } ?: error("Could not open gallery output")
+                        contentResolver.update(destination, android.content.ContentValues().apply {
+                            put(android.provider.MediaStore.Images.Media.IS_PENDING, 0)
+                        }, null, null)
+                    } catch (failure: Throwable) {
+                        contentResolver.delete(destination, null, null)
+                        throw failure
+                    }
+                    showCaptureMessage("已保存到相册", false)
+                }.onFailure { showCaptureMessage("保存截图失败", true) }
+            }
+            Protocol.ACTION_ANNOTATE -> showCaptureMessage("已钉图，可在悬浮图工具栏中标注", false)
+        }
+    }
+
+    private fun showCaptureMessage(message: String, long: Boolean) {
+        captureToast?.cancel()
+        captureToast = android.widget.Toast.makeText(this, message,
+            if (long) android.widget.Toast.LENGTH_LONG else android.widget.Toast.LENGTH_SHORT)
+        captureToast?.show()
     }
 
     /**
@@ -511,7 +692,6 @@ class BallService : Service() {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val manager = getSystemService(NotificationManager::class.java) ?: return
         if (manager.getNotificationChannel(CHANNEL_ID) != null) return
         val channel = NotificationChannel(
@@ -566,11 +746,7 @@ class BallService : Service() {
 
         fun start(context: Context) {
             val intent = Intent(context, BallService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
+            context.startForegroundService(intent)
         }
 
         fun stop(context: Context) {
@@ -602,22 +778,14 @@ class BallService : Service() {
                 .putExtra(EXTRA_BALL_IMAGE_SCALE, scale)
                 .putExtra(EXTRA_BALL_IMAGE_OFFSET_X, offsetX)
                 .putExtra(EXTRA_BALL_IMAGE_OFFSET_Y, offsetY)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
+            context.startForegroundService(intent)
         }
 
         /** Revert the ball to its default red/yellow style. */
         fun clearBallImage(context: Context) {
             val intent = Intent(context, BallService::class.java)
                 .setAction(ACTION_CLEAR_BALL_IMAGE)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
+            context.startForegroundService(intent)
         }
 
         /** True if a custom image has been chosen and persisted. */

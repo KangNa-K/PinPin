@@ -34,12 +34,6 @@
         us a stable canvas for the region-selection UI and survives
         the dialog transition.
     -->
-    <style name="Theme.PinPin.Capture" parent="android:Theme.Material.Light.NoActionBar.Fullscreen">
-        <item name="android:windowBackground">@color/pinpin_background</item>
-        <item name="android:statusBarColor">@android:color/transparent</item>
-        <item name="android:navigationBarColor">@android:color/transparent</item>
-        <item name="android:windowFullscreen">true</item>
-        <item name="android:windowContentOverlay">@null</item>
-    </style>
+
 
 </resources>

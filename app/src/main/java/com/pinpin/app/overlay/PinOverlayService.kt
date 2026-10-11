@@ -15,27 +15,40 @@ import android.graphics.PixelFormat
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
+import android.os.Handler
+import android.os.Looper
+import android.view.View
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Gravity
 import android.view.WindowManager
 import android.widget.ImageView
+import androidx.core.net.toUri
 import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
 import com.pinpin.app.R
+import com.pinpin.app.data.PinAssetStore
 import com.pinpin.app.data.PinEntity
 import com.pinpin.app.data.PinRepository
+import com.pinpin.app.data.writeLosslessPng
+import com.pinpin.app.data.withPngEncoding
+import com.pinpin.app.data.encodeLosslessPng
 import com.pinpin.app.ui.MainActivity
 import dagger.hilt.android.AndroidEntryPoint
 import java.io.File
 import java.io.FileOutputStream
 import javax.inject.Inject
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.CoroutineExceptionHandler
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Foreground service that owns the [WindowManager] and the set of active
@@ -75,6 +88,7 @@ import java.util.concurrent.ConcurrentHashMap
 class PinOverlayService : Service() {
 
     @Inject lateinit var pinRepository: PinRepository
+    @Inject lateinit var assetStore: PinAssetStore
 
     private val windowManager by lazy {
         getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -113,13 +127,19 @@ class PinOverlayService : Service() {
      * still lists these pins; we just do not render them. On the next
      * [setAllPinsVisible] call with `true`, we re-attach the views.
      */
-    private val hiddenPinIds = mutableSetOf<String>()
+    private var allPinsHidden = false
 
-    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob() +
+        CoroutineExceptionHandler { _, failure ->
+            Log.e(TAG, "Overlay operation failed", failure)
+            mainHandler.post { showError("操作未完成，请重试") }
+        })
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         createNotificationChannel()
+        pinRepository.startOverlaySync()
     }
 
     /**
@@ -189,39 +209,25 @@ class PinOverlayService : Service() {
         // a cold start are dropped on the floor — the Compose list updates
         // (because [PinWindowManager.applySnapshot] runs in the caller's
         // process), but no view is ever added to the WindowManager.
-        drainPendingSync(this)
+        applyPinList(pendingSync.getAndSet(null) ?: pinRepository.pinsState.value)
         return START_STICKY
     }
 
     private fun hideAllPins() {
-        // Snapshot the current pin entities from the most recent sync
-        // — we need them to be able to re-attach the views later. Since
-        // [syncPinList] is the only path that adds pins, we can recover
-        // the entity from the [PinWindowView] specs already held in
-        // [activePins].
-        activePins.keys.forEach { id -> hiddenPinIds.add(id) }
-        activePins.values.forEach { view ->
-            runCatching { windowManager.removeView(view) }
-        }
-        activePins.clear()
+        allPinsHidden = true
+        ownedWindows().forEach { it.visibility = View.INVISIBLE }
     }
 
     private fun showAllPins() {
-        if (hiddenPinIds.isEmpty()) return
-        // Re-fetch the full pin list from the repository (the source of
-        // truth) and let [applyPinList] re-attach everything that was
-        // hidden. The repository's StateFlow is cheap to read.
-        scope.launch {
-            pinRepository.pinsState.value
-                .filter { it.id in hiddenPinIds }
-                .let { toRestore ->
-                    hiddenPinIds.clear()
-                    applyPinList(pinRepository.pinsState.value)
-                }
-        }
+        allPinsHidden = false
+        ownedWindows().forEach { it.visibility = View.VISIBLE }
     }
 
+    private fun ownedWindows(): List<View> =
+        activePins.values.toList() + minimizedBalls.values + passthroughButtons.values
+
     override fun onDestroy() {
+        if (instance === this) instance = null
         passthroughButtons.values.forEach { runCatching { windowManager.removeView(it) } }
         passthroughButtons.clear()
         minimizedBalls.values.forEach { runCatching { windowManager.removeView(it) } }
@@ -239,24 +245,17 @@ class PinOverlayService : Service() {
     private fun applyPinList(entities: List<PinEntity>) {
         // 1. Remove views whose id is no longer in the list.
         val newIds = entities.map { it.id }.toSet()
-        val toRemove = activePins.keys - newIds
+        val toRemove = (activePins.keys + minimizedBalls.keys + passthroughButtons.keys) - newIds
         toRemove.forEach { id ->
             removePassthroughButton(id)
             activePins.remove(id)?.let { runCatching { windowManager.removeView(it) } }
+            minimizedBalls.remove(id)?.let { runCatching { windowManager.removeView(it) } }
         }
-        // Also drop them from the hidden set so a later "show all" does
-        // not try to re-attach a pin that no longer exists.
-        hiddenPinIds.retainAll(newIds)
 
         // 2 + 3. Add new views, update existing ones.
         entities.forEach { entity ->
             val existing = activePins[entity.id]
             if (existing == null) {
-                if (entity.id in hiddenPinIds) {
-                    // Pin was hidden — do not re-attach right now; the
-                    // next [setAllPinsVisible] call will pick it up.
-                    return@forEach
-                }
                 if (minimizedBalls.containsKey(entity.id)) {
                     // Pin was collapsed to a floating ball by the
                     // user. The [PinWindowView] was deliberately
@@ -272,25 +271,16 @@ class PinOverlayService : Service() {
                 }
                 attachNew(entity)
             } else {
-                // Update position / size in case the user dragged/resized
-                // before we wrote back to Room (rare race).
-                if (existing.currentX != entity.x || existing.currentY != entity.y) {
-                    existing.updateLayoutFromExternal(entity.x, entity.y)
-                }
-                if (existing.currentW != entity.width.toInt() ||
-                    existing.currentH != entity.height.toInt()
-                ) {
-                    existing.updateSizeFromExternal(entity.width.toInt(), entity.height.toInt())
-                }
-                // Sync the live badge after a renumber. Fires
-                // when another pin was deleted or un-numbered
-                // and the repository re-allocated zOrders. The
-                // on-screen red badge (if shown) and the next
-                // minimized-ball badge are both kept in step.
-                if (entity.zOrder != 0) {
+                if (AnnotationSaveState.isSaving(entity.id)) {
+                    existing.setSerialVisible(entity.serialVisible, entity.zOrder)
+                    existing.spec.zOrder = entity.zOrder
                     existing.updateZOrder(entity.zOrder)
+                } else {
+                    existing.applySnapshot(entity)
                 }
             }
+            (minimizedBalls[entity.id] as? com.pinpin.app.ball.BallView)?.zOrderBadge =
+                entity.zOrder.takeIf { entity.serialVisible }
         }
 
         // 4. Refresh the notification with the current count.
@@ -301,12 +291,16 @@ class PinOverlayService : Service() {
         val spec = PinWindowView.PinSpec(
             label = pinLabel(entity),
             imageUri = entity.imageUri,
+            annotatedImageUri = entity.annotatedImageUri,
             sourceType = entity.sourceType,
             initialX = entity.x,
             initialY = entity.y,
             widthPx = entity.width.toInt(),
             heightPx = entity.height.toInt(),
             locked = entity.locked,
+            serialVisible = entity.serialVisible,
+            rotation = entity.rotation,
+            flipped = entity.flipped,
             // Surface the pin's display order so the "收起"
             // toolbar action can show a numeric badge — the
             // user can tell at a glance which pin the
@@ -322,19 +316,36 @@ class PinOverlayService : Service() {
         val viewRef = arrayOfNulls<PinWindowView>(1)
         val view = PinWindowView(
             context = this,
-            id = entity.id,
+            pinId = entity.id,
             spec = spec,
             onPositionChanged = { x, y ->
-                scope.launch { pinRepository.updatePosition(entity.id, x, y) }
+                val current = viewRef[0]
+                val width = current?.currentW?.toFloat() ?: entity.width
+                val height = current?.currentH?.toFloat() ?: entity.height
+                if (current != null) scope.launch {
+                    try {
+                        pinRepository.updateGeometry(entity.id, x, y, width, height)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (failure: Exception) {
+                        current.geometryCommitFailed()
+                        pinRepository.pinsState.value.firstOrNull { it.id == entity.id }?.let(current::applySnapshot)
+                        Log.e(TAG, "Could not save pin geometry", failure)
+                        showError("位置保存失败，请重试")
+                    }
+                }
             },
-            onSizeChanged = { w, h ->
-                scope.launch { pinRepository.updateSize(entity.id, w, h) }
-            },
+            onSizeChanged = { _, _ -> },
             onCloseClicked = {
                 scope.launch { pinRepository.removePin(entity.id) }
             },
             onActionClicked = { actionId ->
                 viewRef[0]?.let { handlePinAction(it, entity, actionId) }
+            },
+            onLayoutChanged = {
+                viewRef[0]?.postOnAnimation {
+                    repositionPassthroughButton(viewRef[0]!!, entity.id)
+                }
             },
         )
         viewRef[0] = view
@@ -374,6 +385,7 @@ class PinOverlayService : Service() {
             x = spec.initialX
             y = spec.initialY
         }
+        view.visibility = if (allPinsHidden) View.INVISIBLE else View.VISIBLE
         runCatching { windowManager.addView(view, lp) }
             .onSuccess {
                 activePins[entity.id] = view
@@ -403,11 +415,21 @@ class PinOverlayService : Service() {
         entity: PinEntity,
         actionId: String,
     ) {
+        if ((view.annotationSaving || AnnotationSaveState.isSaving(entity.id)) && actionId in setOf(
+                PinWindowView.ACTION_SHARE, PinWindowView.ACTION_SAVE,
+                PinWindowView.ACTION_ANNOTATE, PinWindowView.ACTION_ARROW,
+                PinWindowView.ACTION_MINIMIZE, PinWindowView.ACTION_SAVE_ANNOTATE,
+                PinWindowView.ACTION_APPLY_ANNOTATE,
+            )
+        ) {
+            showError("正在保存标注，请稍候")
+            return
+        }
         when (actionId) {
             PinWindowView.ACTION_ROTATE -> {
                 scope.launch {
-                    val next = pinRepository.rotateClockwise(entity.id)
-                    view.applyRotation(next)
+                    val rotated = pinRepository.rotateClockwise(entity.id) ?: return@launch
+                    if (activePins[entity.id] === view) view.applySnapshot(rotated)
                 }
             }
             PinWindowView.ACTION_FLIP -> {
@@ -416,8 +438,8 @@ class PinOverlayService : Service() {
                     view.applyFlip(next)
                 }
             }
-            PinWindowView.ACTION_SHARE -> sharePinImage(entity)
-            PinWindowView.ACTION_SAVE -> savePinImageToGallery(entity)
+            PinWindowView.ACTION_SHARE -> sharePinImage(view, entity)
+            PinWindowView.ACTION_SAVE -> savePinImageToGallery(view, entity)
             PinWindowView.ACTION_LOCK -> {
                 // Read the current lock state from the live view's
                 // spec, NOT from the cached [entity]. [entity] is
@@ -451,38 +473,12 @@ class PinOverlayService : Service() {
                 minimizePin(entity)
             }
             PinWindowView.ACTION_SERIAL -> {
-                // Toggle a serial number badge on the image.
-                // Toggling also drives the zOrder field in
-                // Room so the rest of the pin set renumbers
-                // automatically: turning a badge OFF drops
-                // the pin out of the numbered sequence
-                // (zOrder -> 0, remaining pins shift up),
-                // turning it back ON gives it the next
-                // available slot.
-                if (view.serialBadge != null) {
-                    view.removeSerialBadge()
-                    scope.launch {
-                        pinRepository.setZOrder(entity.id, 0)
-                        pinRepository.renormalizeZOrders()
-                    }
-                } else {
-                    scope.launch {
-                        // Append to the end of the numbered
-                        // sequence; renormalize then takes
-                        // care of any collisions in case the
-                        // pin already had a stale zOrder.
-                        val nextZ = pinRepository.nextAvailableZOrder()
-                        pinRepository.setZOrder(entity.id, nextZ)
-                        pinRepository.renormalizeZOrders()
-                        // showSerialBadge uses the live
-                        // zOrder AFTER the renumber so the
-                        // badge matches the rest of the
-                        // sequence (it may have shifted if
-                        // another pin was deleted in the
-                        // meantime).
-                        val currentZ = pinRepository.findZOrder(entity.id) ?: nextZ
-                        view.showSerialBadge(currentZ)
-                    }
+                // Serial visibility is independent from zOrder. Toggling the
+                // badge must not renumber or reorder any other Pin.
+                val nextVisible = view.serialBadge == null
+                view.setSerialVisible(nextVisible, view.spec.zOrder)
+                scope.launch {
+                    pinRepository.setSerialVisible(entity.id, nextVisible)
                 }
             }
             PinWindowView.ACTION_ANNOTATE -> {
@@ -518,41 +514,16 @@ class PinOverlayService : Service() {
                 view.exitAnnotationMode(discardChanges = false)
             }
             PinWindowView.ACTION_SAVE_ANNOTATE -> {
-                // Apply AND save to MediaStore (Pictures/pinpin).
-                // The composited image is first written to the
-                // pin's imageUri (same as Apply), then a copy is
-                // pushed to MediaStore so the user can find it
-                // in the device gallery.
-                val bitmapHolder = arrayOfNulls<android.graphics.Bitmap>(1)
+                // Composite once, then let saveAnnotatedImage write the
+                // internal file and copy that file to MediaStore in the
+                // same IO operation. Reusing the Bitmap from two
+                // independent coroutines used to race with bitmap.recycle().
+                val rotation = view.spec.rotation
+                val flipped = view.spec.flipped
                 view.onAnnotationDone = { bmp ->
-                    bitmapHolder[0] = bmp
-                    saveAnnotatedImage(view, entity, bmp)
+                    saveAnnotatedImage(view, entity, bmp, saveToGallery = true, rotation = rotation, flipped = flipped)
                 }
                 view.exitAnnotationMode(discardChanges = false)
-                // After exit, the bitmap was composited; copy to gallery.
-                bitmapHolder[0]?.let { bmp ->
-                    scope.launch(Dispatchers.IO) {
-                        runCatching {
-                            val values = android.content.ContentValues().apply {
-                                put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, "pinpin-annot-${entity.id.take(8)}.png")
-                                put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/png")
-                                put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/pinpin")
-                            }
-                            val dest = contentResolver.insert(
-                                android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                                values,
-                            ) ?: return@runCatching
-                            contentResolver.openOutputStream(dest)?.use { out ->
-                                bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
-                            }
-                            android.widget.Toast.makeText(
-                                this@PinOverlayService,
-                                "已保存到相册",
-                                android.widget.Toast.LENGTH_SHORT,
-                            ).show()
-                        }.onFailure { Log.e(TAG, "save annotated to gallery failed", it) }
-                    }
-                }
             }
             else -> Log.w(TAG, "unknown action $actionId for pin[${entity.id}]")
         }
@@ -569,33 +540,40 @@ class PinOverlayService : Service() {
      * sharing `file://` URIs with other apps (FileUriExposedException),
      * and FLAG_GRANT_READ_URI_PERMISSION only works with content URIs.
      */
-    private fun sharePinImage(entity: PinEntity) {
-        val rawUri = runCatching { Uri.parse(entity.imageUri) }.getOrNull() ?: return
-        val shareUri: Uri = if (rawUri.scheme == "file") {
-            // Convert file:// to content:// via FileProvider
-            val file = File(rawUri.path ?: return)
-            runCatching {
-                FileProvider.getUriForFile(
-                    this,
-                    "${packageName}.fileprovider",
-                    file,
-                )
-            }.getOrNull() ?: rawUri
-        } else {
-            rawUri
+    private fun sharePinImage(view: PinWindowView, entity: PinEntity) {
+        val snapshot = view.exportSnapshot() ?: return showError("图片载入后再分享")
+        scope.launch {
+            val file = withContext(NonCancellable + Dispatchers.IO) {
+                val directory = File(cacheDir.canonicalFile, "exports").apply { mkdirs() }
+                val now = System.currentTimeMillis()
+                directory.listFiles()?.filter {
+                    it.name.startsWith("pin-") && it.extension == "png" &&
+                        now - it.lastModified() > 24 * 60 * 60 * 1000L
+                }?.forEach { it.delete() }
+                val target = File(directory, "pin-${java.util.UUID.randomUUID()}.png")
+                ImageRenderWork.run {
+                    val bitmap = snapshot.render(contentResolver)
+                    try {
+                        writeLosslessPng(bitmap, target)
+                        target
+                    } catch (failure: Throwable) {
+                        target.delete()
+                        throw failure
+                    } finally {
+                        bitmap.recycle()
+                    }
+                }
+            }
+            val uri = FileProvider.getUriForFile(this@PinOverlayService, "$packageName.fileprovider", file)
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "image/png"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                clipData = android.content.ClipData.newRawUri("PinPin", uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(send, getString(R.string.pin_action_share))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         }
-        val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "image/*"
-            putExtra(Intent.EXTRA_STREAM, shareUri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        runCatching {
-            startActivity(
-                Intent.createChooser(intent, getString(R.string.pin_action_share)).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                },
-            )
-        }.onFailure { Log.e(TAG, "share failed for ${entity.id}", it) }
     }
 
     /**
@@ -604,50 +582,24 @@ class PinOverlayService : Service() {
      * URI (works for both `content://` and `file://`) and pipe
      * them straight into a new Pictures/pinpin row.
      */
-    private fun savePinImageToGallery(entity: PinEntity) {
+    private fun savePinImageToGallery(view: PinWindowView, entity: PinEntity) {
+        val snapshot = view.exportSnapshot() ?: return showError("图片载入后再保存")
         scope.launch {
-            runCatching {
-                val resolver = contentResolver
-                val srcRaw = runCatching { Uri.parse(entity.imageUri) }.getOrNull()
-                    ?: return@runCatching
-                // For file:// URIs, open via File directly; for
-                // content:// URIs, use the content resolver.
-                val src = if (srcRaw.scheme == "file") {
-                    // FileProvider doesn't help here — we need an
-                    // InputStream, so open the file directly.
-                    val file = File(srcRaw.path ?: return@runCatching)
-                    if (!file.exists()) return@runCatching
-                    null // signal to use file-based path below
-                } else {
-                    srcRaw
-                }
-                val mime = src?.let { resolver.getType(it) } ?: "image/png"
-                val values = android.content.ContentValues().apply {
-                    put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, "pinpin-${entity.id.take(8)}.png")
-                    put(android.provider.MediaStore.Images.Media.MIME_TYPE, mime)
-                    put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/pinpin")
-                }
-                val dest = resolver.insert(
-                    android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    values,
-                ) ?: return@runCatching
-                resolver.openOutputStream(dest)?.use { out ->
-                    if (src != null) {
-                        resolver.openInputStream(src)?.use { input ->
-                            input.copyTo(out)
-                        } ?: return@runCatching
-                    } else {
-                        // file:// path — read directly
-                        val file = File(srcRaw.path ?: return@runCatching)
-                        file.inputStream().use { input -> input.copyTo(out) }
+            withContext(NonCancellable) {
+                ImageRenderWork.run {
+                    val bitmap = snapshot.render(contentResolver)
+                    try {
+                        withPngEncoding {
+                            writeGalleryImage(entity.id) { output ->
+                                encodeLosslessPng(bitmap, output)
+                            }
+                        }
+                    } finally {
+                        bitmap.recycle()
                     }
                 }
-                android.widget.Toast.makeText(
-                    this@PinOverlayService,
-                    getString(R.string.pin_action_save_toast),
-                    android.widget.Toast.LENGTH_SHORT,
-                ).show()
-            }.onFailure { Log.e(TAG, "save failed for ${entity.id}", it) }
+            }
+            showError(getString(R.string.pin_action_save_toast))
         }
     }
 
@@ -689,13 +641,12 @@ class PinOverlayService : Service() {
         //    so the gesture feels like "shrink to a ball" rather
         //    than "teleport to a corner".
         val ballView = com.pinpin.app.ball.BallView(this)
-        val density = resources.displayMetrics.density
-        val ballSize = (56 * density).toInt() + (20 * density).toInt() // 76dp hit area
+        val ballSize = ballView.minimumWidth
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
         windowManager.defaultDisplay.getRealMetrics(metrics)
-        val pinCenterX = entity.x + entity.width.toInt() / 2
-        val pinCenterY = entity.y + entity.height.toInt() / 2
+        val pinCenterX = view.currentX + view.currentW / 2
+        val pinCenterY = view.currentY + view.currentH / 2
         val initialX = (pinCenterX - ballSize / 2)
             .coerceIn(0, (metrics.widthPixels - ballSize).coerceAtLeast(0))
         val initialY = (pinCenterY - ballSize / 2)
@@ -722,7 +673,9 @@ class PinOverlayService : Service() {
         ballView.onTap = { restorePin(entity.id) }
         // 5. Show the pin's image inside the ball so the user
         //    can see what they're about to restore.
-        val uri = runCatching { android.net.Uri.parse(entity.imageUri) }.getOrNull()
+        val uri = runCatching {
+            effectiveImageUri(view, entity).toUri()
+        }.getOrNull()
         if (uri != null) {
             runCatching { ballView.setBallImageUri(uri) }
                 .onFailure { Log.w(TAG, "minimizePin: setBallImageUri failed for ${entity.id}", it) }
@@ -735,9 +688,13 @@ class PinOverlayService : Service() {
         val badgeNumber = view.serialBadgeNumber()
         ballView.zOrderBadge = badgeNumber
 
+        ballView.visibility = if (allPinsHidden) View.INVISIBLE else View.VISIBLE
         runCatching { windowManager.addView(ballView, lp) }
             .onSuccess { minimizedBalls[entity.id] = ballView }
-            .onFailure { Log.e(TAG, "minimizePin: addView(ball) failed for ${entity.id}", it) }
+            .onFailure {
+                Log.e(TAG, "minimizePin: addView(ball) failed for ${entity.id}", it)
+                attachNew(pinRepository.pinsState.value.firstOrNull { pin -> pin.id == entity.id } ?: entity)
+            }
 
         // The notification count no longer includes this pin
         // (it's not currently a full window), but the user
@@ -786,36 +743,117 @@ class PinOverlayService : Service() {
     }
 
     /**
-     * Save the composited (original + annotation) bitmap to the
-     * cache directory and update the pin's imageUri to point to
-     * the new file. The old file is left in place (it might be
-     * referenced by other entities or the history table).
+     * Save the composited annotation and optionally export the saved file
+     * to MediaStore. The Bitmap is owned by this function and is recycled
+     * only after every consumer has finished with it.
      */
-    private fun saveAnnotatedImage(view: PinWindowView, entity: PinEntity, bitmap: Bitmap) {
-        scope.launch(Dispatchers.IO) {
-            runCatching {
-                val dir = File(cacheDir, "screenshots")
-                if (!dir.exists()) dir.mkdirs()
-                val file = File(dir, "annotated-${entity.id.take(8)}-${System.currentTimeMillis()}.png")
-                FileOutputStream(file).use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+    private suspend fun saveAnnotatedImage(
+        view: PinWindowView,
+        entity: PinEntity,
+        bitmap: Bitmap,
+        saveToGallery: Boolean = false,
+        rotation: Int = view.spec.rotation,
+        flipped: Boolean = view.spec.flipped,
+    ) {
+        view.annotationSaving = true
+        withContext(NonCancellable + Dispatchers.IO) {
+            var gallerySaved = false
+            var savedUri: Uri? = null
+            try {
+                if (pinRepository.findZOrder(entity.id) == null) return@withContext
+                savedUri = assetStore.saveBitmap(bitmap, "annotated")
+                val newUri = savedUri.toString()
+                if (!pinRepository.updateAnnotatedImage(entity.id, newUri)) return@withContext
+                if (saveToGallery) {
+                    if (rotation % 360 == 0 && !flipped) {
+                        writeGalleryImage(entity.id) { out ->
+                            File(requireNotNull(savedUri.path)).inputStream().use { it.copyTo(out) }
+                        }
+                    } else {
+                        val exported = PinImageSnapshot(bitmap, rotation, flipped).render()
+                        try {
+                            withPngEncoding {
+                                writeGalleryImage(entity.id) { out -> encodeLosslessPng(exported, out) }
+                            }
+                        } finally { exported.recycle() }
+                    }
+                    gallerySaved = true
                 }
-                bitmap.recycle()
-                val newUri = Uri.fromFile(file).toString()
-                // Persist the post-annotation URI in its own column.
-                // The original [PinEntity.imageUri] is left untouched
-                // so the user can always revert to the pre-annotation
-                // image; the overlay service prefers annotatedImageUri
-                // over imageUri when both are set.
-                pinRepository.updateAnnotatedImage(entity.id, newUri)
-                // Update the live view on the main thread. The view's
-                // [PinWindowView.setAnnotatedImageUri] updates only the
-                // display state — `spec.imageUri` is left intact.
-                scope.launch(Dispatchers.Main) {
-                    view.setAnnotatedImageUri(newUri)
+
+                // Persist only after the internal file has been written.
+                withContext(Dispatchers.Main) {
+                    if (activePins[entity.id] === view) view.setAnnotatedImageUri(newUri)
+                    if (gallerySaved) {
+                        android.widget.Toast.makeText(
+                            this@PinOverlayService,
+                            getString(R.string.pin_action_save_toast),
+                            android.widget.Toast.LENGTH_SHORT,
+                        ).show()
+                    }
                 }
-            }.onFailure { Log.e(TAG, "saveAnnotatedImage failed for ${entity.id}", it) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (t: Exception) {
+                Log.e(TAG, "saveAnnotatedImage failed for ${entity.id}", t)
+                withContext(Dispatchers.Main) { showError("标注或相册保存未完成，请检查图片和存储空间") }
+            } finally {
+                try {
+                    savedUri?.let { pinRepository.discardUnreferencedAsset(it) }
+                } finally {
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                    withContext(Dispatchers.Main) { view.annotationSaving = false }
+                }
+            }
         }
+    }
+
+    private fun copyFileToGallery(file: File, pinId: String): Boolean {
+        return try {
+            writeGalleryImage(pinId) { output -> file.inputStream().use { it.copyTo(output) } }
+            true
+        } catch (failure: Exception) {
+            Log.e(TAG, "Gallery export failed", failure)
+            false
+        }
+    }
+
+    private fun writeGalleryImage(pinId: String, write: (java.io.OutputStream) -> Unit) {
+        val resolver = contentResolver
+        val values = android.content.ContentValues().apply {
+            put(
+                android.provider.MediaStore.Images.Media.DISPLAY_NAME,
+                "pinpin-annot-${pinId.take(8)}.png",
+            )
+            put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/png")
+            put(android.provider.MediaStore.Images.Media.IS_PENDING, 1)
+            put(
+                android.provider.MediaStore.Images.Media.RELATIVE_PATH,
+                "Pictures/pinpin",
+            )
+        }
+        val dest = resolver.insert(
+            android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            values,
+        ) ?: error("Could not create gallery entry")
+
+        try {
+            resolver.openOutputStream(dest)?.use { output ->
+                write(output)
+            } ?: error("Could not open MediaStore output stream")
+            resolver.update(dest, android.content.ContentValues().apply {
+                put(android.provider.MediaStore.Images.Media.IS_PENDING, 0)
+            }, null, null)
+        } catch (t: Throwable) {
+            resolver.delete(dest, null, null)
+            throw t
+        }
+    }
+
+    private fun effectiveImageUri(view: PinWindowView, entity: PinEntity): String =
+        view.spec.annotatedImageUri ?: view.spec.imageUri ?: entity.imageUri
+
+    private fun showError(message: String) {
+        android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_LONG).show()
     }
 
     // region Passthrough floating button
@@ -831,7 +869,6 @@ class PinOverlayService : Service() {
         if (passthroughButtons.containsKey(pinId)) return
         val density = resources.displayMetrics.density
         val closeSize = dpToPxCompat(40f, density)
-        val closeMargin = dpToPxCompat(8f, density)
         // Read the current theme tokens so the exit-passthrough
         // button visually matches the main toolbar pill. The
         // [applyThemeToAllPins] re-apply loop re-tints this
@@ -853,42 +890,62 @@ class PinOverlayService : Service() {
                 view.setPassthrough(false)
             }
         }
-        // Defer the position computation until the pin view has
-        // been laid out. The close button's exact screen position
-        // depends on its layout, which only happens after the
-        // window manager has measured the view. PinWindowView's
-        // `imageCard` has CENTER_HORIZONTAL gravity inside the
-        // wrapper, so we must read imageCard.left/right to get
-        // the true visible bounds, not the wrapper bounds.
+        // Wait for layout before anchoring the separate exit control
+        // to the image's passthrough button, including wrapped rows.
         pinView.post {
-            val lp = WindowManager.LayoutParams(
-                closeSize,
-                closeSize,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                    or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT,
-            ).apply {
-                gravity = Gravity.TOP or Gravity.START
-                // Anchor to the close button's exact screen
-                // position. The close button sits inside
-                // imageCard with a 8dp topMargin + 8dp marginEnd,
-                // so its left edge = imageCard.left + 8dp and
-                // its top = imageCard.top + 8dp. We need its
-                // SCREEN coordinates, which are the wrapper's
-                // window origin (set via layoutParams.x/y) plus
-                // the child's position within the wrapper.
-                val wrapperLp = pinView.layoutParams as? WindowManager.LayoutParams
-                val originX = wrapperLp?.x ?: pinView.currentX
-                val originY = wrapperLp?.y ?: pinView.currentY
-                val cb = pinView.closeButtonScreenRect()
-                x = cb.left
-                y = cb.top
+            pinView.postOnAnimation {
+                if (activePins[pinId] === pinView &&
+                    pinView.isPassthrough() &&
+                    !passthroughButtons.containsKey(pinId)
+                ) {
+                    val lp = WindowManager.LayoutParams(
+                        closeSize,
+                        closeSize,
+                        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                            or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                        PixelFormat.TRANSLUCENT,
+                    ).apply {
+                        gravity = Gravity.TOP or Gravity.START
+                        setFitInsetsTypes(0)
+                        layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                        val cb = pinView.passthroughButtonScreenRect()
+                        x = cb.left
+                        y = cb.top
+                    }
+                    button.visibility = if (allPinsHidden) View.INVISIBLE else View.VISIBLE
+                    runCatching { windowManager.addView(button, lp) }
+                        .onSuccess {
+                            passthroughButtons[pinId] = button
+                            button.post { repositionPassthroughButton(pinView, pinId) }
+                        }
+                        .onFailure { Log.e(TAG, "Failed to add passthrough button for $pinId", it) }
+                }
             }
-            runCatching { windowManager.addView(button, lp) }
-                .onSuccess { passthroughButtons[pinId] = button }
-                .onFailure { Log.e(TAG, "Failed to add passthrough button for $pinId", it) }
         }
+    }
+
+    /**
+     * Keep the top-level exit button anchored to the action button inside
+     * the pin window. The two windows have independent WindowManager
+     * layout params, so moving or resizing the pin cannot move this one
+     * automatically.
+     */
+    private fun repositionPassthroughButton(pinView: PinWindowView, pinId: String) {
+        val button = passthroughButtons[pinId] ?: return
+        if (activePins[pinId] !== pinView || !pinView.isPassthrough()) return
+        val lp = button.layoutParams as? WindowManager.LayoutParams ?: return
+        val rect = pinView.passthroughButtonScreenRect()
+        val actual = IntArray(2)
+        button.getLocationOnScreen(actual)
+        val dx = rect.left - actual[0]
+        val dy = rect.top - actual[1]
+        if (dx == 0 && dy == 0) return
+        lp.x += dx
+        lp.y += dy
+        runCatching { windowManager.updateViewLayout(button, lp) }
+            .onFailure { Log.w(TAG, "Failed to reposition passthrough button for $pinId", it) }
     }
 
     private fun removePassthroughButton(pinId: String) {
@@ -955,7 +1012,6 @@ class PinOverlayService : Service() {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val manager = getSystemService(NotificationManager::class.java) ?: return
         if (manager.getNotificationChannel(CHANNEL_ID) != null) return
         val channel = NotificationChannel(
@@ -978,14 +1034,13 @@ class PinOverlayService : Service() {
         private const val ACTION_STOP = "com.pinpin.app.overlay.STOP"
         private const val ACTION_HIDE_ALL_PINS = "com.pinpin.app.overlay.HIDE_ALL_PINS"
         private const val ACTION_SHOW_ALL_PINS = "com.pinpin.app.overlay.SHOW_ALL_PINS"
+        @Volatile private var instance: PinOverlayService? = null
+        private val mainHandler = Handler(Looper.getMainLooper())
 
         fun start(context: Context) {
+            if (!android.provider.Settings.canDrawOverlays(context)) return
             val intent = Intent(context, PinOverlayService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
+            context.startForegroundService(intent)
         }
 
         fun stop(context: Context) {
@@ -1010,12 +1065,8 @@ class PinOverlayService : Service() {
          * pipeline runs, which is not an Activity scope.
          */
         fun setAllPinsVisible(context: Context, visible: Boolean) {
-            val intent = Intent(context, PinOverlayService::class.java)
-                .setAction(if (visible) ACTION_SHOW_ALL_PINS else ACTION_HIDE_ALL_PINS)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            mainHandler.post {
+                instance?.let { if (visible) it.showAllPins() else it.hideAllPins() }
             }
         }
 
@@ -1036,23 +1087,22 @@ class PinOverlayService : Service() {
                     x = e.x,
                     y = e.y,
                     locked = e.locked,
-                    imageUri = e.imageUri,
+                    imageUri = e.annotatedImageUri ?: e.imageUri,
                     sourceType = e.sourceType,
                     zOrder = e.zOrder,
                 )
             })
 
-            start(context)
-            // We post the actual diff to a service-side queue. The service
-            // drains the queue in [onStartCommand] — even though we just
-            // called `start` and the service might not be fully created
-            // yet, the queue is drained on the next `onStartCommand` call
-            // (which `start` triggers synchronously enough on the same
-            // thread for the enqueue-then-drain pattern to work).
-            synchronized(pendingSync) { pendingSync.add(pins) }
+            // Overlay rendering is state synchronization, not an event log:
+            // only the newest snapshot matters. Store it BEFORE starting or
+            // re-starting the service so onStartCommand cannot drain an empty
+            // container and miss this update. A newer Room invalidation simply
+            // replaces an obsolete intermediate snapshot.
+            pendingSync.set(pins)
+            mainHandler.post { instance?.let(::drainPendingSync) }
         }
 
-        private val pendingSync: MutableList<List<PinEntity>> = mutableListOf()
+        private val pendingSync = AtomicReference<List<PinEntity>?>(null)
 
         private fun labelFor(e: PinEntity): String = when (e.sourceType) {
             "test" -> "测试图 #${e.zOrder}"
@@ -1063,17 +1113,14 @@ class PinOverlayService : Service() {
         }
 
         /**
-         * Drain the [pendingSync] queue. Called from `onStartCommand` so
-         * that callers do not have to wait for the service to be fully
-         * created before issuing a sync.
+         * Drain the newest pending snapshot. Called from `onStartCommand` so
+         * callers do not have to wait for the service to be fully created
+         * before issuing a sync. Intermediate snapshots are intentionally
+         * discarded: the overlay should converge on the latest Room state,
+         * never replay an old state after a newer one.
          */
         internal fun drainPendingSync(service: PinOverlayService) {
-            synchronized(pendingSync) {
-                while (pendingSync.isNotEmpty()) {
-                    val next = pendingSync.removeAt(pendingSync.lastIndex)
-                    service.applyPinList(next)
-                }
-            }
+            pendingSync.getAndSet(null)?.let(service::applyPinList)
         }
     }
 }

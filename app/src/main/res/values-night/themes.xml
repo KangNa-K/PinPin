@@ -18,12 +18,6 @@
         <item name="android:windowBackground">@color/pinpin_background</item>
     </style>
 
-    <style name="Theme.PinPin.Capture" parent="android:Theme.Material.NoActionBar.Fullscreen">
-        <item name="android:windowBackground">@color/pinpin_background</item>
-        <item name="android:statusBarColor">@android:color/transparent</item>
-        <item name="android:navigationBarColor">@android:color/transparent</item>
-        <item name="android:windowFullscreen">true</item>
-        <item name="android:windowContentOverlay">@null</item>
-    </style>
+
 
 </resources>

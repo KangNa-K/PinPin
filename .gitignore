@@ -22,3 +22,7 @@ captures/
 *.aar
 .DS_Store
 *.log
+
+# Local distribution artifacts
+dist/
+*.idsig

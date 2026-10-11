@@ -47,6 +47,8 @@ data class PinEntity(
     val rotation: Int = 0,
     /** Whether the image is horizontally flipped. */
     val flipped: Boolean = false,
+    /** Whether the serial-number badge is visible on the overlay. */
+    val serialVisible: Boolean = false,
     /**
      * URI of the post-annotation image, or null if the pin has never
      * been annotated. The original [imageUri] is kept untouched; this

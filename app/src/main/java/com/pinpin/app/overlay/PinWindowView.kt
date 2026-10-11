@@ -1,5 +1,7 @@
 package com.pinpin.app.overlay
 
+import androidx.core.net.toUri
+import androidx.core.graphics.toColorInt
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.res.ColorStateList
@@ -7,18 +9,21 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.graphics.PixelFormat
 import android.graphics.Typeface
+import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.util.Log
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -27,12 +32,20 @@ import coil.imageLoader
 import coil.request.ImageRequest
 import coil.request.SuccessResult
 import com.pinpin.app.R
+import com.pinpin.app.data.PinEntity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.roundToInt
+import java.util.Locale
 
 /**
  * A single floating pin window. Owns the visual + touch handling for one
@@ -84,9 +97,10 @@ import kotlin.math.hypot
  *  alpha 1 + translationY 16dp → 0 (250ms). Tapping outside
  *  (`ACTION_OUTSIDE`) reverses the animation.
  */
+@SuppressLint("ViewConstructor")
 class PinWindowView(
     context: Context,
-    val id: String,
+    val pinId: String,
     /** Mutable so the "锁定" toolbar action can flip the flag on
      *  the live view without going through Room. The repository
      *  still persists the change. */
@@ -95,6 +109,13 @@ class PinWindowView(
     private val onSizeChanged: (w: Float, h: Float) -> Unit,
     private val onCloseClicked: () -> Unit,
     private val onActionClicked: (actionId: String) -> Unit,
+    /**
+     * Called whenever the live WindowManager geometry changes. This is
+     * intentionally separate from the persistence callbacks above: the
+     * overlay service can keep auxiliary windows visually aligned during
+     * a gesture without writing every intermediate frame to Room.
+     */
+    private val onLayoutChanged: () -> Unit = {},
 ) : FrameLayout(context) {
 
     data class PinSpec(
@@ -133,6 +154,9 @@ class PinWindowView(
          *  it in place after the repository renumbers the
          *  remaining pins. */
         var zOrder: Int,
+        var serialVisible: Boolean = false,
+        var rotation: Int = 0,
+        var flipped: Boolean = false,
     )
 
     // ----------------------------------------------------------------
@@ -188,6 +212,11 @@ class PinWindowView(
     private var downLayoutX: Int = spec.initialX
     private var downLayoutY: Int = spec.initialY
     private var dragged: Boolean = false
+    private var interacting = false
+    private var gestureStartW = spec.widthPx
+    private var gestureStartH = spec.heightPx
+    private var deferredSnapshot: PinEntity? = null
+    private var awaitingGeometryCommit = false
 
     // ----------------------------------------------------------------
     // Tap-to-select state.
@@ -223,8 +252,82 @@ class PinWindowView(
     private val imageCard: FrameLayout
     private val imageView: ImageView
     private val closeButton: ImageButton
+    private val imageActionButtons = mutableListOf<ImageButton>()
     private val label: TextView?
     private val toolbar: LinearLayout
+    private val toolbarViewport: HorizontalScrollView
+    private var toolbarColumns = 0
+    private var cornerMoved = false
+
+    private fun toolbarWidth(): Int =
+        7 * dpToPx(TOOLBAR_BUTTON_DP)
+
+    private fun toolbarRows(@Suppress("UNUSED_PARAMETER") width: Int): Int = 1
+
+    private fun arrangeToolbar(@Suppress("UNUSED_PARAMETER") width: Int) {
+        // The image toolbar is intentionally a single horizontal row.
+        // Its viewport can scroll horizontally, but the row itself is
+        // never split into multiple lines.
+        val columns = 7
+        toolbarViewport.layoutParams = toolbarViewport.layoutParams.apply {
+            this.width = toolbarWidth()
+        }
+        if (columns == toolbarColumns) return
+        val buttons = mutableListOf<View>()
+        if (toolbarColumns == 0) {
+            for (i in 0 until toolbar.childCount) {
+                val child = toolbar.getChildAt(i)
+                if (child.isClickable) buttons.add(child)
+            }
+        } else {
+            for (i in 0 until toolbar.childCount) {
+                val row = toolbar.getChildAt(i) as LinearLayout
+                for (j in 0 until row.childCount) buttons.add(row.getChildAt(j))
+            }
+        }
+        buttons.forEach { (it.parent as android.view.ViewGroup).removeView(it) }
+        toolbar.removeAllViews()
+        toolbar.orientation = LinearLayout.VERTICAL
+        buttons.chunked(columns).forEach { group ->
+            val row = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+            group.forEach { row.addView(it) }
+            toolbar.addView(row, LinearLayout.LayoutParams(
+                LayoutParams.MATCH_PARENT, dpToPx(TOOLBAR_HEIGHT_DP),
+            ))
+        }
+        toolbarColumns = columns
+    }
+
+    // The unrotated source bitmap (decoded from the active URI).
+    // Rotation is applied on top of this — see [applyCurrentRotation]. We
+    // cache it so a rotation re-applied after the image has been
+    // reloaded (e.g. switching back from the annotated image) still
+    // works. Cleared and re-populated every time the source URI
+    // changes via [loadImage]. Coil owns the source bitmap.
+    private var sourceBitmap: Bitmap? = null
+
+    // 0/90/180/270. The state we persist via PinEntity.rotation and
+    // the only thing we need to remember between user interactions.
+    // We DO NOT use `imageView.rotation` for state — that field
+    // stays 0f because the image matrix rotates the drawable. Tracking
+    // it in our own field keeps the rotation correct after a source
+    // reload or window resize.
+    private var currentRotation: Int = spec.rotation
+    private var imageLoadJob: Job? = null
+    internal var annotationSaving = false
+    private var annotationRenderJob: Job? = null
+
+    internal suspend fun awaitAnnotationRendering() {
+        annotationRenderJob?.join()
+    }
+
+    internal fun exportSnapshot(): PersistedPinImageSnapshot? =
+        (spec.annotatedImageUri ?: spec.imageUri)?.let {
+            PersistedPinImageSnapshot(it.toUri(), currentRotation, spec.flipped)
+        }
 
     private val windowManager =
         context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -237,8 +340,8 @@ class PinWindowView(
     private val handleFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val handleStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val inactiveHandleFill = Color.WHITE
-    private val inactiveHandleStroke = Color.parseColor("#7AA7FF")
-    private val activeHandleFill = Color.parseColor("#7AA7FF")
+    private val inactiveHandleStroke = "#7AA7FF".toColorInt()
+    private val activeHandleFill = "#7AA7FF".toColorInt()
     private val activeHandleStroke = Color.WHITE
 
     /** Rounded-corner radius of the image card. Captured for handle positioning. */
@@ -247,29 +350,26 @@ class PinWindowView(
     init {
         val initialImageW = spec.widthPx
         val initialImageH = spec.heightPx
-        val toolbarH = dpToPx(TOOLBAR_HEIGHT_DP)
-        val gapH = dpToPx(TOOLBAR_GAP_DP)
-        val minToolbarW = dpToPx(MIN_TOOLBAR_WIDTH_DP)
-        // Wrapper is wide enough to fit the toolbar at its full
-        // design width. If the image is narrower, the wrapper grows
-        // and the imageCard is centered inside it so the toolbar
-        // can sit centered on the image without being clipped. If
-        // the image is wider than the toolbar, the wrapper is the
-        // image's width and the toolbar floats below.
-        val wrapperW = maxOf(initialImageW, minToolbarW)
-        val wrapperH = initialImageH + gapH + toolbarH
+        // Controls scroll within the image width rather than expanding
+        // the overlay's input window into the surrounding app.
+        val wrapperW = maxOf(initialImageW, toolbarWidth())
+        val wrapperH = initialImageH
 
         layoutParams = WindowManager.LayoutParams(
             wrapperW,
             wrapperH,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                 or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                 or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
                 or WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
+            // Match the selection overlay's display-pixel coordinate space.
+            setFitInsetsTypes(0)
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
             x = spec.initialX
             y = spec.initialY
         }
@@ -313,7 +413,7 @@ class PinWindowView(
             elevation = dpToPx(6f).toFloat()
             background = GradientDrawable(
                 GradientDrawable.Orientation.TL_BR,
-                intArrayOf(Color.parseColor("#7AA7FF"), Color.parseColor("#3D5DBF")),
+                intArrayOf("#7AA7FF".toColorInt(), "#3D5DBF".toColorInt()),
             ).apply { cornerRadius = cornerRadiusPx }
         }
         addView(imageCard)
@@ -329,10 +429,10 @@ class PinWindowView(
                 shape = android.graphics.drawable.GradientDrawable.RECTANGLE
                 setStroke(
                     (resources.displayMetrics.density * 2).toInt(),
-                    Color.parseColor("#80FF6F00"),
+                    "#80FF6F00".toColorInt(),
                 )
                 cornerRadius = cornerRadiusPx
-                setColor(Color.parseColor("#00000000"))
+                setColor("#00000000".toColorInt())
             }
             alpha = 0f
             isClickable = false
@@ -355,10 +455,10 @@ class PinWindowView(
                 shape = android.graphics.drawable.GradientDrawable.RECTANGLE
                 setStroke(
                     (resources.displayMetrics.density * 3).toInt(),
-                    Color.parseColor("#E53935"),
+                    "#E53935".toColorInt(),
                 )
                 cornerRadius = cornerRadiusPx
-                setColor(Color.parseColor("#00000000"))
+                setColor("#00000000".toColorInt())
             }
             alpha = 0f
             isClickable = false
@@ -405,10 +505,20 @@ class PinWindowView(
                 topMargin = closeMargin.toInt()
                 marginEnd = closeMargin.toInt()
             }
-            setOnClickListener { onCloseClicked() }
+            setOnClickListener {
+                if (annotationMode) exitAnnotationMode(discardChanges = true) else onCloseClicked()
+            }
             alpha = 0f
+            visibility = View.INVISIBLE
+            isEnabled = false
         }
         imageCard.addView(closeButton)
+        imageActionButtons.add(makeImageActionButton(ACTION_PASSTHROUGH, R.drawable.ic_action_passthrough, R.string.pin_action_passthrough))
+        imageActionButtons.add(makeImageActionButton(ACTION_LOCK, R.drawable.ic_action_lock_open, R.string.pin_action_lock))
+        imageActionButtons.add(makeImageActionButton(ACTION_MINIMIZE, R.drawable.ic_action_minimize, R.string.pin_action_minimize))
+        lockButtonIcon = imageActionButtons[1]
+        setLockButtonLocked(spec.locked)
+        arrangeImageActions(initialImageW)
 
         // Optional test-pin label (shown only when there's no image).
         // Prefer the annotated URI if one is set — same image the user
@@ -432,25 +542,27 @@ class PinWindowView(
         }
 
         // ============ toolbar ============
-        // Horizontal pill of 9 actions, 4 dividers between groups.
+        // Seven actions below the image; window controls live on the image.
         // Hidden by default (alpha 0). `clickable = true` so taps in
         // its bounds are consumed and don't leak to the corner-drag
         // hit-test (which would otherwise start a corner drag the
         // moment the user tapped near the BL/BR corner of the image).
         toolbar = buildToolbar().apply {
-            alpha = 0f
-            translationY = dpToPx(TOOLBAR_ANIM_TRANSLATE_DP).toFloat()
             isClickable = true
         }
+        toolbarViewport = HorizontalScrollView(context).apply {
+            isHorizontalScrollBarEnabled = false
+            visibility = View.INVISIBLE
+            alpha = 0f
+            translationY = dpToPx(TOOLBAR_ANIM_TRANSLATE_DP).toFloat()
+            addView(toolbar, LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT,
+            ))
+        }
         addView(
-            toolbar,
+            toolbarViewport,
             FrameLayout.LayoutParams(
-                // WRAP_CONTENT, not MATCH_PARENT: the toolbar pill
-                // should size to its content (9 icon buttons + 4
-                // dividers). If we matched parent, it would stretch
-                // to the imageCard width on resize, compressing each
-                // button and hiding affordances.
-                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
                 dpToPx(TOOLBAR_HEIGHT_DP),
                 // Center horizontally so the toolbar sits below the
                 // image, not glued to its left edge.
@@ -462,22 +574,52 @@ class PinWindowView(
                 topMargin = dpToPx(TOOLBAR_GAP_DP) + initialImageH
             },
         )
+        arrangeToolbar(initialImageW)
+
+        imageCard.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            arrangeImageActions(imageCard.width)
+        }
 
         setOnClickListener { /* consume taps so they don't fall through */ }
+        imageView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            applyCurrentRotation()
+        }
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        scope.cancel()
+        sourceBitmap = null
+        imageView.setImageDrawable(null)
     }
 
     internal fun loadImage(uriString: String) {
-        scope.launch {
-            val uri = runCatching { Uri.parse(uriString) }.getOrNull() ?: return@launch
+        imageLoadJob?.cancel()
+        sourceBitmap = null
+        val load = scope.launch {
+            val uri = runCatching { uriString.toUri() }.getOrNull() ?: return@launch
             val request = ImageRequest.Builder(context)
                 .data(uri)
-                .target { drawable -> imageView.setImageDrawable(drawable) }
-                .crossfade(true)
+                .size(2048, 2048)
+                .allowHardware(false)
                 .build()
             val result = context.imageLoader.execute(request)
-            if (result !is SuccessResult) {
+            if (result is SuccessResult) {
+                sourceBitmap = (result.drawable as? BitmapDrawable)?.bitmap
+                imageView.setImageDrawable(result.drawable)
+                // The blue card background is only a placeholder for
+                // image-less pins. A real image must never reveal it
+                // when a rotation or resize is being applied.
+                imageCard.setBackgroundColor(Color.TRANSPARENT)
+                applyCurrentRotation()
+            } else {
                 Log.w(TAG, "Image load failed for $uriString; falling back to placeholder")
+                android.widget.Toast.makeText(context, "图片读取失败，请重新导入", android.widget.Toast.LENGTH_SHORT).show()
             }
+        }
+        imageLoadJob = load
+        load.invokeOnCompletion {
+            if (imageLoadJob === load) imageLoadJob = null
         }
     }
 
@@ -502,57 +644,6 @@ class PinWindowView(
         if (target != null) {
             loadImage(target)
         }
-    }
-
-    /**
-     * Synchronously decode the original pin image and hand it to
-     * [imageView]. Used by [enterAnnotationMode] when the pin
-     * zooms up to the full screen — Coil's cached drawable was
-     * sampled at the pin's original thumbnail size, so when the
-     * imageView suddenly jumps to fitW × fitH (the screen), a
-     * FIT_CENTER-scaled drawable would render as a tiny postage
-     * stamp surrounded by the card's blue gradient.
-     *
-     * We decode the full-resolution bitmap with an [inSampleSize]
-     * computed to keep memory bounded (target ≤ 2× the view
-     * dimensions), and set it as a [BitmapDrawable] directly on
-     * the imageView with `CENTER_CROP` so it fills the new
-     * imageCard. Synchronous on purpose: we need the bitmap in
-     * place before the user starts drawing, so they never see a
-     * blank blue card while Coil reloads in the background.
-     */
-    private fun loadOriginalBitmapSync(targetW: Int, targetH: Int) {
-        val uriStr = spec.imageUri ?: return
-        val uri = runCatching { Uri.parse(uriStr) }.getOrNull() ?: return
-        val bmp = runCatching {
-            val resolver = context.contentResolver
-            // First pass: just bounds, to compute inSampleSize
-            val boundsOpts = BitmapFactory.Options().apply {
-                inJustDecodeBounds = true
-            }
-            resolver.openInputStream(uri)?.use { input ->
-                BitmapFactory.decodeStream(input, null, boundsOpts)
-            }
-            val origW = boundsOpts.outWidth
-            val origH = boundsOpts.outHeight
-            if (origW <= 0 || origH <= 0) return@runCatching null
-            // Sample down so neither dimension exceeds 2× the
-            // target. The 2× headroom gives CENTER_CROP enough
-            // pixels to cover the view cleanly without bloating
-            // memory for a 4K screenshot.
-            var sample = 1
-            while (origW / sample > targetW * 2 || origH / sample > targetH * 2) {
-                sample *= 2
-            }
-            val opts = BitmapFactory.Options().apply {
-                inSampleSize = sample
-                inPreferredConfig = Bitmap.Config.ARGB_8888
-            }
-            resolver.openInputStream(uri)?.use { input ->
-                BitmapFactory.decodeStream(input, null, opts)
-            }
-        }.getOrNull() ?: return
-        imageView.setImageBitmap(bmp)
     }
 
     // ----------------------------------------------------------------
@@ -602,37 +693,56 @@ class PinWindowView(
             addView(makeToolbarButton(ACTION_SERIAL, R.drawable.ic_action_serial, R.string.pin_action_serial))
             addView(makeToolbarButton(ACTION_ANNOTATE, R.drawable.ic_action_annotate, R.string.pin_action_annotate))
             addView(makeToolbarButton(ACTION_ARROW, R.drawable.ic_action_arrow, R.string.pin_action_arrow))
-            // Group 4: 穿透 / 锁定 / 收起
-            addView(makeToolbarDivider())
-            addView(makeToolbarButton(ACTION_PASSTHROUGH, R.drawable.ic_action_passthrough, R.string.pin_action_passthrough))
-            // Default state is *unlocked*, so start with the
-            // open-padlock glyph. The closed glyph + red tint are
-            // applied on the first tap via [setLockButtonLocked].
-            addView(makeToolbarButton(ACTION_LOCK, R.drawable.ic_action_lock_open, R.string.pin_action_lock).also { btn ->
-                // The inner ImageView is the only child and is
-                // tagged with [ToolbarIconTag] by
-                // [makeToolbarButton]. Walk the small tree to
-                // cache the handle so the toggle is O(1) later.
-                var icon: ImageView? = null
-                if (btn is android.view.ViewGroup) {
-                    for (i in 0 until btn.childCount) {
-                        val child = btn.getChildAt(i)
-                        if (child is ImageView) { icon = child; break }
-                    }
+        }
+    }
+
+    private fun makeImageActionButton(action: String, icon: Int, description: Int): ImageButton =
+        ImageButton(context).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(theme.surfaceFill)
+                setStroke(dpToPx(1), theme.surfaceStroke)
+            }
+            setImageResource(icon)
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            imageTintList = ColorStateList.valueOf(theme.iconColor)
+            contentDescription = context.getString(description)
+            layoutParams = LayoutParams(dpToPx(CLOSE_BUTTON_SIZE_DP), dpToPx(CLOSE_BUTTON_SIZE_DP))
+            alpha = 0f
+            visibility = View.INVISIBLE
+            isEnabled = false
+            setOnClickListener { onActionClicked(action) }
+            imageCard.addView(this)
+        }
+
+    private fun arrangeImageActions(width: Int) {
+        val size = dpToPx(CLOSE_BUTTON_SIZE_DP)
+        val margin = dpToPx(CLOSE_BUTTON_MARGIN_DP)
+        val step = size + dpToPx(4f)
+        val columns = ((width - margin * 2 + dpToPx(4f)) / step).coerceIn(1, 4)
+        // Keep close at the top-right; fill each row towards the left.
+        (imageActionButtons + closeButton).asReversed().forEachIndexed { index, button ->
+            val end = margin + (index % columns) * step
+            val top = margin + (index / columns) * step
+            val params = button.layoutParams as LayoutParams
+            if (params.marginEnd != end || params.topMargin != top || params.gravity != (Gravity.TOP or Gravity.END)) {
+                button.layoutParams = LayoutParams(size, size).apply {
+                    gravity = Gravity.TOP or Gravity.END
+                    marginEnd = end
+                    topMargin = top
                 }
-                lockButtonIcon = icon
-            })
-            // Group 5: 收起 — tear down the pin window and
-            // replace it with a floating ball that shows the
-            // pin's image. Tapping the ball restores the full
-            // pin. Lives at the very right of the toolbar so the
-            // user is unlikely to hit it accidentally (it's
-            // separated from the destructive lock by a divider).
-            // The number badge is intentionally NOT shown here —
-            // it lives on the floating ball so the user only
-            // sees it once the pin has actually been minimized.
-            addView(makeToolbarDivider())
-            addView(makeToolbarButton(ACTION_MINIMIZE, R.drawable.ic_action_minimize, R.string.pin_action_minimize))
+            }
+        }
+    }
+
+    private fun restoreImageActionVisibility() {
+        imageActionButtons.forEach { button ->
+            button.animate().cancel()
+            val shown = toolbarShown && !annotationMode
+            button.visibility = if (shown) View.VISIBLE else View.INVISIBLE
+            button.isEnabled = shown
+            button.alpha = if (shown) 1f else 0f
+            button.bringToFront()
         }
     }
 
@@ -660,11 +770,11 @@ class PinWindowView(
             // untouched.
             val idle = android.graphics.drawable.GradientDrawable().apply {
                 shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(Color.parseColor("#00000000"))
+                setColor("#00000000".toColorInt())
             }
             val pressed = android.graphics.drawable.GradientDrawable().apply {
                 shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(Color.parseColor("#1F000000"))
+                setColor("#1F000000".toColorInt())
             }
             background = android.graphics.drawable.StateListDrawable().apply {
                 addState(intArrayOf(android.R.attr.state_pressed), pressed)
@@ -723,11 +833,11 @@ class PinWindowView(
             // other toolbar buttons.
             val idle = android.graphics.drawable.GradientDrawable().apply {
                 shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(Color.parseColor("#00000000"))
+                setColor("#00000000".toColorInt())
             }
             val pressed = android.graphics.drawable.GradientDrawable().apply {
                 shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(Color.parseColor("#1F000000"))
+                setColor("#1F000000".toColorInt())
             }
             background = android.graphics.drawable.StateListDrawable().apply {
                 addState(intArrayOf(android.R.attr.state_pressed), pressed)
@@ -756,7 +866,7 @@ class PinWindowView(
         val badgeSize = (16 * density).toInt()
         val badgeInset = (1 * density).toInt()
         val badge = TextView(context).apply {
-            text = zOrderBadge.toString()
+            text = String.format(Locale.getDefault(), "%d", zOrderBadge)
             setTextColor(Color.WHITE)
             textSize = 10f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
@@ -764,7 +874,7 @@ class PinWindowView(
             setBackgroundColor(Color.TRANSPARENT)
             background = android.graphics.drawable.GradientDrawable().apply {
                 shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(Color.parseColor("#E53935"))
+                setColor("#E53935".toColorInt())
                 setStroke((1 * density).toInt(), Color.WHITE)
             }
             layoutParams = android.widget.FrameLayout.LayoutParams(
@@ -787,7 +897,7 @@ class PinWindowView(
     private fun makeToolbarDivider(): View = View(context).apply {
         background = android.graphics.drawable.GradientDrawable().apply {
             shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-            setColor(Color.parseColor("#22000000"))
+            setColor("#22000000".toColorInt())
             setSize(dpToPx(1), dpToPx(20))
         }
         layoutParams = LinearLayout.LayoutParams(dpToPx(1), dpToPx(20)).apply {
@@ -816,52 +926,37 @@ class PinWindowView(
 
     fun isToolbarShown(): Boolean = toolbarShown
 
-    /**
-     * Apply a 0/90/180/270 rotation to the imageView. The imageCard
-     * itself is NOT rotated — only the inner imageView — so the
-     * rounded outline and the toolbar layout stay aligned with the
-     * pin's bounding box.
-     *
-     * Implementation: rather than just setting `imageView.rotation`
-     * (which leaves a FIT_CENTER-scaled bitmap centered in the
-     * imageCard's original rectangle, causing a huge band of the
-     * card's blue background to show through when the card's
-     * aspect ratio differs from the image's), we *also* swap the
-     * imageView's layoutParams dimensions. That way the rotated
-     * imageView bounding box matches the rotation 90°/270° swap,
-     * the FIT_CENTER bitmap is laid out in the swapped rectangle
-     * (which already has the rotated aspect ratio), and no blue
-     * gap appears.
-     */
+    /** Apply the image transform; the persisted bounds are synced separately by [applySnapshot]. */
     fun applyRotation(rotation: Int) {
         val deg = ((rotation % 360) + 360) % 360
-        // Snapshot the card's current size BEFORE we mutate anything
-        // so we can compute the swapped imageView rectangle.
-        val cardW = imageCard.width
-        val cardH = imageCard.height
-        if (cardW <= 0 || cardH <= 0) return
-        imageView.rotation = deg.toFloat()
-        val lp = imageView.layoutParams as? LayoutParams ?: return
-        if (deg == 90 || deg == 270) {
-            // Swap: imageView layout box becomes cardH × cardW, so
-            // after the 90° rotation the visible content fills the
-            // full cardW × cardH.
-            lp.width = cardH
-            lp.height = cardW
-        } else {
-            // 0°/180°: keep MATCH_PARENT so the bitmap is scaled
-            // against the card's natural rectangle.
+        currentRotation = deg
+        spec.rotation = deg
+        imageView.rotation = 0f
+        imageView.layoutParams = imageView.layoutParams.also { lp ->
             lp.width = LayoutParams.MATCH_PARENT
             lp.height = LayoutParams.MATCH_PARENT
         }
-        // Cancel the rotation's pivot offset: by default a rotated
-        // view's rotation pivot is the center of its un-rotated
-        // layout box. After we change the layoutParams to a
-        // swapped rectangle, the layout box's center may not be the
-        // card's center anymore, so we re-center via gravity.
-        lp.gravity = Gravity.CENTER
-        imageView.layoutParams = lp
-        imageView.requestLayout()
+        applyCurrentRotation()
+    }
+
+    /** Update a matrix, never allocate a rotated bitmap during a gesture. */
+    private fun applyCurrentRotation() {
+        if (sourceBitmap == null) return
+        val drawable = imageView.drawable ?: return
+        // BitmapDrawable density can change its intrinsic size. The display
+        // matrix uses drawable coordinates; export compensates for this below.
+        val matrix = Matrix().apply {
+            setValues(PinImageTransform.values(
+                drawable.intrinsicWidth.coerceAtLeast(1),
+                drawable.intrinsicHeight.coerceAtLeast(1),
+                currentW.coerceAtLeast(1),
+                currentH.coerceAtLeast(1),
+                currentRotation, spec.flipped, annotationMode || currentRotation != 0,
+            ))
+        }
+        imageView.scaleX = 1f
+        imageView.scaleType = ImageView.ScaleType.MATRIX
+        imageView.imageMatrix = matrix
     }
 
     /**
@@ -869,7 +964,8 @@ class PinWindowView(
      * is unchanged.
      */
     fun applyFlip(flipped: Boolean) {
-        imageView.scaleX = if (flipped) -1f else 1f
+        spec.flipped = flipped
+        applyCurrentRotation()
     }
 
     /**
@@ -893,6 +989,11 @@ class PinWindowView(
     fun setPassthrough(enabled: Boolean) {
         if (passthrough == enabled) return
         passthrough = enabled
+        // The service adds a separate, touchable exit button because this
+        // window becomes non-touchable in passthrough mode. Keep only one
+        // visual affordance by hiding the matching button inside this
+        // window until passthrough is disabled again.
+        applyPassthroughActionVisibility()
         // Visually distinguish passthrough state so the user
         // understands why the image is no longer responding to
         // taps. A subtle dashed outline on the imageCard (drawn
@@ -967,7 +1068,7 @@ class PinWindowView(
      *  responsible for persisting the new image and updating the
      *  pin's imageUri.
      */
-    var onAnnotationDone: ((compositedBitmap: android.graphics.Bitmap) -> Unit)? = null
+    var onAnnotationDone: (suspend (compositedBitmap: android.graphics.Bitmap) -> Unit)? = null
 
     // ----------------------------------------------------------------
     // Serial number badge
@@ -987,18 +1088,19 @@ class PinWindowView(
      */
     fun showSerialBadge(number: Int) {
         removeSerialBadge()
+        spec.serialVisible = true
         val density = resources.displayMetrics.density
         val size = (32 * density).toInt()
         val margin = (8 * density).toInt()
         val badge = TextView(context).apply {
-            text = number.toString()
+            text = String.format(Locale.getDefault(), "%d", number)
             setTextColor(Color.WHITE)
             textSize = 14f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             gravity = Gravity.CENTER
             background = android.graphics.drawable.GradientDrawable().apply {
                 shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(Color.parseColor("#E53935"))
+                setColor("#E53935".toColorInt())
             }
             layoutParams = LayoutParams(size, size).apply {
                 gravity = Gravity.TOP or Gravity.START
@@ -1014,6 +1116,11 @@ class PinWindowView(
     fun removeSerialBadge() {
         _serialBadge?.let { imageCard.removeView(it) }
         _serialBadge = null
+        spec.serialVisible = false
+    }
+
+    fun setSerialVisible(visible: Boolean, number: Int = spec.zOrder) {
+        if (visible) showSerialBadge(number) else removeSerialBadge()
     }
 
     /**
@@ -1044,7 +1151,7 @@ class PinWindowView(
     fun updateZOrder(newZ: Int) {
         if (spec.zOrder == newZ) return
         spec.zOrder = newZ
-        _serialBadge?.text = newZ.toString()
+        _serialBadge?.text = String.format(Locale.getDefault(), "%d", newZ)
     }
 
     fun isPassthrough(): Boolean = passthrough
@@ -1073,12 +1180,14 @@ class PinWindowView(
     fun applyTheme() {
         theme = PinTheme.of(context)
 
-        // Close button
-        (closeButton.background as? android.graphics.drawable.GradientDrawable)?.apply {
-            setColor(theme.surfaceFill)
-            setStroke(dpToPx(1), theme.surfaceStroke)
+        // Image controls share the toolbar's theme tokens.
+        (imageActionButtons + closeButton).forEach { button ->
+            (button.background as? GradientDrawable)?.apply {
+                setColor(theme.surfaceFill)
+                setStroke(dpToPx(1), theme.surfaceStroke)
+            }
+            button.imageTintList = ColorStateList.valueOf(theme.iconColor)
         }
-        closeButton.imageTintList = ColorStateList.valueOf(theme.iconColor)
 
         // Toolbar pill
         (toolbar.background as? android.graphics.drawable.GradientDrawable)?.apply {
@@ -1143,7 +1252,16 @@ class PinWindowView(
      */
     fun enterAnnotationMode(drawingMode: DrawingOverlayView.Mode = DrawingOverlayView.Mode.PEN) {
         if (annotationMode) return
+        if (annotationSaving || annotationRenderJob?.isActive == true || AnnotationSaveState.isSaving(pinId)) {
+            android.widget.Toast.makeText(context, "上一份标注正在保存", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (sourceBitmap == null || imageLoadJob != null) {
+            android.widget.Toast.makeText(context, "图片载入后再开始标注", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
         annotationMode = true
+        restoreImageActionVisibility()
 
         // 1. Save current state
         preAnnotationX = currentX
@@ -1164,8 +1282,8 @@ class PinWindowView(
         val padding = (resources.displayMetrics.density * 32).toInt()
         val toolbarOverheadForFit =
             dpToPx(TOOLBAR_GAP_DP) * 2 + dpToPx(TOOLBAR_HEIGHT_DP)
-        val maxW = screenW - padding * 2
-        val maxH = screenH - padding * 2 - toolbarOverheadForFit
+        val maxW = (screenW - padding * 2).coerceAtLeast(1)
+        val maxH = (screenH - padding * 2 - toolbarOverheadForFit).coerceAtLeast(1)
         val aspect = if (currentH > 0) currentW.toFloat() / currentH.toFloat() else 1f
         val fitW: Int
         val fitH: Int
@@ -1177,9 +1295,12 @@ class PinWindowView(
             fitH = (maxW / aspect).toInt()
         }
 
-        // Centre on screen.
+        // Centre the image and its bottom toolbar as one group.
+        // Centering the image in the full screen would place the
+        // toolbar below the visible area on tall images.
         val fitX = (screenW - fitW) / 2
-        val fitY = (screenH - fitH) / 2
+        val groupHeight = fitH + dpToPx(TOOLBAR_GAP_DP) + dpToPx(TOOLBAR_HEIGHT_DP)
+        val fitY = ((screenH - groupHeight) / 2).coerceAtLeast(padding)
 
         // Apply the zoom.
         currentW = fitW
@@ -1189,6 +1310,20 @@ class PinWindowView(
         applyLayoutSize(fitW, fitH)
         applyLayoutPosition(fitX, fitY)
 
+        // Widen the wrapper to the full screen width so the
+        // annotation toolbar (MATCH_PARENT) has maximum
+        // horizontal space. The imageCard is centred inside
+        // the wrapper via Gravity.CENTER_HORIZONTAL, so it
+        // stays visually centred on screen even though the
+        // wrapper is now wider than the image.
+        val wrapperLp = layoutParams as? WindowManager.LayoutParams
+        if (wrapperLp != null) {
+            wrapperLp.width = screenW
+            wrapperLp.x = 0
+            currentX = 0
+            runCatching { windowManager.updateViewLayout(this, wrapperLp) }
+        }
+
         // Reset the imageView to fill the new imageCard. A
         // FIT_CENTER-scaled drawable would render at its
         // intrinsic resolution in the middle of the card,
@@ -1197,20 +1332,13 @@ class PinWindowView(
         // to fully cover the card so the user sees the image
         // edge-to-edge while drawing on it.
         //
-        // We also synchronously reload the source bitmap here
-        // (rather than reusing the cached thumbnail) so the
-        // imageView has a high-resolution drawable sized for
-        // the new view, not a tiny cached sample that would
-        // render blurry. The reload runs on the main thread
-        // but is bounded to ≤2× the target dimensions via
-        // inSampleSize, so it stays snappy even for 4K
-        // screenshots.
-        loadOriginalBitmapSync(fitW, fitH)
-        imageView.scaleType = ImageView.ScaleType.CENTER_CROP
+        // Reuse the asynchronously decoded active image, including saved ink.
+        applyCurrentRotation()
 
         // 3. Add drawing overlay
         val overlay = DrawingOverlayView(context).apply {
             mode = drawingMode
+            shapeRecognitionEnabled = true
             strokeColor = selectedAnnotationColor
             // Eraser color matches the toolbar surface so the
             // rubber-band visually "wipes" the area. Light theme
@@ -1223,11 +1351,17 @@ class PinWindowView(
         }
         imageCard.addView(overlay)
         drawingOverlay = overlay
+        // The drawing canvas must never cover the emergency exit.
+        closeButton.animate().cancel()
+        closeButton.visibility = View.VISIBLE
+        closeButton.isEnabled = true
+        closeButton.alpha = 1f
+        closeButton.bringToFront()
 
         // 4. Show annotation toolbar
         val annToolbar = buildAnnotationToolbar()
         addView(annToolbar, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.MATCH_PARENT,
             dpToPx(TOOLBAR_HEIGHT_DP),
             Gravity.TOP or Gravity.CENTER_HORIZONTAL,
         ).apply {
@@ -1250,7 +1384,8 @@ class PinWindowView(
         //    so the user always has a way to back out
         //    even if the annotation toolbar overflows off
         //    the bottom of the screen.
-        toolbar.alpha = 0f
+        toolbarViewport.visibility = View.INVISIBLE
+        repositionAnnotationToolbar()
     }
 
     /**
@@ -1262,77 +1397,111 @@ class PinWindowView(
      */
     fun exitAnnotationMode(discardChanges: Boolean = false) {
         if (!annotationMode) return
-        annotationMode = false
-
-        // 1. Composite drawing onto image (unless the user chose to
-        //    discard). discardChanges is used by the "×" cancel
-        //    button on the annotation toolbar — the strokes are
-        //    thrown away so the pin reverts to its pre-annotation
-        //    appearance.
+        val startedAt = SystemClock.uptimeMillis()
+        Log.d(TAG, "Annotation exit requested: discard=$discardChanges saving=$annotationSaving")
         val overlay = drawingOverlay
-        if (!discardChanges && overlay != null && overlay.hasStrokes()) {
-            val drawingBmp = overlay.renderToBitmap()
-            // Get the original image bitmap from imageView
-            val originalDrawable = imageView.drawable
-            if (originalDrawable != null) {
-                val origW = originalDrawable.intrinsicWidth.coerceAtLeast(1)
-                val origH = originalDrawable.intrinsicHeight.coerceAtLeast(1)
-                val composited = android.graphics.Bitmap.createBitmap(origW, origH, Bitmap.Config.ARGB_8888)
-                val canvas = Canvas(composited)
-                // Draw original image
-                originalDrawable.setBounds(0, 0, origW, origH)
-                originalDrawable.draw(canvas)
-                // Scale and draw annotation
-                canvas.scale(origW.toFloat() / overlay.width, origH.toFloat() / overlay.height)
-                canvas.drawBitmap(drawingBmp, 0f, 0f, null)
-                drawingBmp.recycle()
-                // Notify host to save the composited image
-                onAnnotationDone?.invoke(composited)
-            } else {
-                drawingBmp.recycle()
+        var snapshot: AnnotationSnapshot? = null
+        val consumer = onAnnotationDone
+        try {
+            if (!discardChanges && overlay != null && overlay.hasStrokes()) {
+                snapshot = captureAnnotation(overlay)
+            }
+        } catch (failure: Exception) {
+            reportAnnotationFailure(failure)
+        } catch (failure: OutOfMemoryError) {
+            reportAnnotationFailure(failure)
+        } finally {
+            // Always remove the canvas, even if rendering fails. Otherwise
+            // a non-annotation window can be left covered by an orphan canvas.
+            annotationMode = false
+            overlay?.let { imageCard.removeView(it) }
+            drawingOverlay = null
+            annotationToolbar?.let { removeView(it) }
+            annotationToolbar = null
+            annotationPenButton = null
+            annotationEraserButton = null
+
+            currentW = preAnnotationW
+            currentH = preAnnotationH
+            currentX = preAnnotationX
+            currentY = preAnnotationY
+            applyLayoutSize(preAnnotationW, preAnnotationH)
+            applyLayoutPosition(preAnnotationX, preAnnotationY)
+            applyCurrentRotation()
+
+            toolbarViewport.animate().cancel()
+            closeButton.animate().cancel()
+            toolbarViewport.visibility = if (toolbarShown) View.VISIBLE else View.INVISIBLE
+            toolbarViewport.alpha = if (toolbarShown) 1f else 0f
+            toolbarViewport.translationY = 0f
+            closeButton.visibility = if (toolbarShown) View.VISIBLE else View.INVISIBLE
+            closeButton.isEnabled = toolbarShown
+            closeButton.alpha = if (toolbarShown) 1f else 0f
+            restoreImageActionVisibility()
+            deferredSnapshot?.let {
+                deferredSnapshot = null
+                applySnapshot(it)
             }
         }
 
-        // 2. Remove drawing overlay and annotation toolbar
-        overlay?.let { imageCard.removeView(it) }
-        drawingOverlay = null
-        annotationToolbar?.let { removeView(it) }
-        annotationToolbar = null
-
-        // 3. Restore original size/position. enterAnnotationMode
-        //    re-fits the imageCard to the screen, so we need
-        //    to put it back at the user's pre-annotation state.
-        //    This is the "image auto-returns to its original
-        //    position" the user has now confirmed they want.
-        currentW = preAnnotationW
-        currentH = preAnnotationH
-        currentX = preAnnotationX
-        currentY = preAnnotationY
-        applyLayoutSize(preAnnotationW, preAnnotationH)
-        applyLayoutPosition(preAnnotationX, preAnnotationY)
-        // Reset the imageView's scaleType back to the small
-        // pin default so the image isn't cropped at
-        // thumbnail size.
-        imageView.scaleType = ImageView.ScaleType.FIT_CENTER
-
-        // 4. Show regular toolbar and close button
-        if (toolbarShown) {
-            toolbar.alpha = 1f
-            closeButton.alpha = 1f
+        // View state is restored before any pixel allocation; retain only immutable input.
+        snapshot?.let { captured ->
+            if (!AnnotationSaveState.begin(pinId)) {
+                reportAnnotationFailure(IllegalStateException("Annotation save already in progress"))
+                return@let
+            }
+            annotationSaving = true
+            android.widget.Toast.makeText(context, "正在保存标注…", android.widget.Toast.LENGTH_SHORT).show()
+            annotationRenderJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                withContext(NonCancellable) {
+                    var rendered: Bitmap? = null
+                    try {
+                        ImageRenderWork.run {
+                            val bitmap = captured.render()
+                            rendered = bitmap
+                            if (consumer != null) {
+                                withContext(Dispatchers.Main) { consumer(bitmap) }
+                                rendered = null
+                            }
+                        }
+                    } catch (failure: Exception) {
+                        reportAnnotationFailure(failure)
+                    } catch (failure: OutOfMemoryError) {
+                        reportAnnotationFailure(failure)
+                    } finally {
+                        rendered?.let { if (!it.isRecycled) it.recycle() }
+                        annotationSaving = false
+                        AnnotationSaveState.end(pinId)
+                    }
+                }
+            }
         }
+        Log.d(TAG, "Annotation exit finished in ${SystemClock.uptimeMillis() - startedAt}ms")
+    }
+
+    private fun captureAnnotation(overlay: DrawingOverlayView): AnnotationSnapshot {
+        val source = checkNotNull(sourceBitmap)
+        val originalDrawable = checkNotNull(imageView.drawable)
+        val inverse = Matrix()
+        check(imageView.imageMatrix.invert(inverse))
+        return AnnotationSnapshot(
+            source, overlay.snapshot(), FloatArray(9).also { inverse.getValues(it) },
+            originalDrawable.intrinsicWidth.coerceAtLeast(1),
+            originalDrawable.intrinsicHeight.coerceAtLeast(1),
+        )
+    }
+
+    private fun reportAnnotationFailure(failure: Throwable) {
+        Log.e(TAG, "Could not finish annotation for $pinId", failure)
+        android.widget.Toast.makeText(context, "标注未保存，已退出涂鸦，请重试", android.widget.Toast.LENGTH_SHORT).show()
     }
 
     fun isAnnotationMode(): Boolean = annotationMode
 
+    private var annotationPenButton: View? = null
+    private var annotationEraserButton: View? = null
+
     /**
-     * The pen button, when active, shows a small brush-style +
-     * brush-width sub-panel below the main toolbar. The sub-panel
-     * is collapsed by default. Tapping the pen button toggles
-     * its visibility, and tapping a brush style or adjusting the
-     * slider updates the active style / width on the drawing
-     * overlay.
-     */
-/**
      * The color currently selected on the annotation toolbar's 8
      * swatch row. Updated when the user taps a swatch; the toolbar
      * is rebuilt only on entry to annotation mode, so the active
@@ -1352,20 +1521,11 @@ class PinWindowView(
      */
     private val swatchViews: MutableList<View> = mutableListOf()
 
-    /**
-     * Build the annotation toolbar in the order requested:
-     * [红] [黑] [签字笔] [橡皮擦] [撤销] [重做] [保存] [应用] [取消]
-     *
-     * The toolbar is a vertical LinearLayout with two rows: the
-     * main pill at the top and a brush sub-panel (hidden by
-     * default) below. Tapping the pen button toggles the
-     * sub-panel; the sub-panel holds brush style icons + a
-     * width slider, modeled on the iOS / Samsung Notes style
-     * picker.
-     */
+    /** Scrollable drawing tools with fixed save, apply and cancel actions. */
     private fun buildAnnotationToolbar(): LinearLayout {
+        val density = resources.displayMetrics.density
         val toolbar = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
+            orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_HORIZONTAL
             // Theme-aware surface so the toolbar blends with the
             // rest of the pin UI in both light and dark mode.
@@ -1377,6 +1537,11 @@ class PinWindowView(
             }
             clipToOutline = true
             elevation = 0f
+            // Horizontal padding so the toolbar pill doesn't
+            // touch the screen edges when the wrapper is full
+            // screen width.
+            val hPad = (12 * density).toInt()
+            setPadding(hPad, 0, hPad, 0)
         }
 
         // ---- Main row ----
@@ -1407,18 +1572,14 @@ class PinWindowView(
             mainRow.addView(swatch)
         }
         mainRow.addView(makeVerticalDivider())
-        // 3. 签字笔 — simply switches drawing mode back to
-        //    PEN. The old design opened a brush-style
-        //    sub-panel here; the user asked to remove
-        //    that entire sub-panel, so this button is
-        //    now a flat mode toggle.
-        mainRow.addView(makeAnnotationActionButton(R.drawable.ic_action_annotate, "签字笔") {
-            drawingOverlay?.mode = DrawingOverlayView.Mode.PEN
-        })
-        // 4. 橡皮擦 — same flat mode toggle, no sub-panel.
-        mainRow.addView(makeAnnotationActionButton(R.drawable.ic_action_eraser, "橡皮擦") {
-            drawingOverlay?.mode = DrawingOverlayView.Mode.ERASER
-        })
+        // Shape recognition is built into the pen, not a separate tool.
+        annotationPenButton = makeAnnotationActionButton(R.drawable.ic_action_annotate, "签字笔") {
+            selectAnnotationMode(DrawingOverlayView.Mode.PEN)
+        }.also { mainRow.addView(it) }
+        annotationEraserButton = makeAnnotationActionButton(R.drawable.ic_action_eraser, "橡皮擦") {
+            selectAnnotationMode(DrawingOverlayView.Mode.ERASER)
+        }.also { mainRow.addView(it) }
+        refreshAnnotationModeSelection()
         // 4b. Brush-size slider. Both pen and eraser read
         //     strokeWidth off the same drawingOverlay, so
         //     dragging here changes the size for whichever
@@ -1437,26 +1598,37 @@ class PinWindowView(
         mainRow.addView(makeAnnotationActionButton(R.drawable.ic_action_redo, "重做") {
             drawingOverlay?.redo()
         })
-        mainRow.addView(makeVerticalDivider())
-        // 7. 保存 — apply AND save to gallery
-        mainRow.addView(makeAnnotationActionButton(R.drawable.ic_action_save, "保存") {
+        // Keep exit actions outside the scrolling tools so they remain reachable.
+        val exitActions = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        exitActions.addView(makeAnnotationActionButton(R.drawable.ic_action_save, "保存") {
             onActionClicked(ACTION_SAVE_ANNOTATE)
         })
         // 8. 应用 — apply annotation, restore size/position, exit
-        mainRow.addView(makeAnnotationActionButton(R.drawable.ic_action_apply, "应用") {
-            onActionClicked(ACTION_APPLY_ANNOTATE)
+        exitActions.addView(makeAnnotationActionButton(R.drawable.ic_action_apply, "应用") {
+            exitAnnotationMode()
         })
         // 9. 取消 — discard and exit
-        mainRow.addView(makeAnnotationActionButton(R.drawable.ic_close, "取消", asCancel = true) {
-            onActionClicked(ACTION_CANCEL_ANNOTATE)
+        exitActions.addView(makeAnnotationActionButton(R.drawable.ic_close, "取消", asCancel = true) {
+            exitAnnotationMode(discardChanges = true)
         })
 
-        toolbar.addView(mainRow)
-        // The old brush sub-panel (3 brush-style buttons +
-        // pen/eraser segmented toggle + width slider) has
-        // been removed per user request. Pen and eraser
-        // are now plain mode toggles above; brush style
-        // and stroke width are stuck at their defaults.
+        toolbar.addView(
+            HorizontalScrollView(context).apply {
+                isHorizontalScrollBarEnabled = false
+                layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    dpToPx(TOOLBAR_HEIGHT_DP),
+                    1f,
+                )
+                addView(mainRow)
+            }
+        )
+        toolbar.addView(makeVerticalDivider())
+        toolbar.addView(exitActions)
+        // Pen and eraser switch directly; width stays on the shared slider.
         return toolbar
     }
 
@@ -1515,7 +1687,7 @@ class PinWindowView(
         val divider = View(context).apply {
             background = android.graphics.drawable.GradientDrawable().apply {
                 shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                setColor(Color.parseColor("#22000000"))
+                setColor("#22000000".toColorInt())
                 setSize(dpToPx(1), dpToPx(20))
             }
             layoutParams = LinearLayout.LayoutParams(dpToPx(1), dpToPx(20)).apply {
@@ -1537,6 +1709,12 @@ class PinWindowView(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
             )
             contentDescription = "笔刷大小"
+            // Keep the gesture inside SeekBar instead of letting the
+            // overlay wrapper classify it as a window drag.
+            setOnTouchListener { view, event ->
+                view.parent?.requestDisallowInterceptTouchEvent(true)
+                false
+            }
             setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(
                     seekBar: android.widget.SeekBar?,
@@ -1578,7 +1756,7 @@ class PinWindowView(
         // ring on the outside so the active choice is obvious
         // against the other 7 swatches in the row.
         val strokePx = if (isSelected) (3 * density).toInt() else (1 * density).toInt()
-        val strokeColor = if (isSelected) Color.WHITE else Color.parseColor("#33FFFFFF")
+        val strokeColor = if (isSelected) Color.WHITE else "#33FFFFFF".toColorInt()
         return LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -1623,21 +1801,26 @@ class PinWindowView(
      * selection ring, and remembers the choice for the duration
      * of this annotation session.
      *
-     * Idempotent: picking the already-active color is a no-op
-     * (no view invalidation, no overlay re-tag) so the toolbar
-     * doesn't flicker if the user double-taps.
+     * Picking even the already-active color returns to the pen;
+     * only a changed color needs to refresh the swatch rings.
      */
     private fun selectAnnotationColor(color: Int) {
+        selectAnnotationMode(DrawingOverlayView.Mode.PEN)
         if (selectedAnnotationColor == color) return
         selectedAnnotationColor = color
         drawingOverlay?.strokeColor = color
-        // Switch back to PEN mode in case the user was on the
-        // eraser — picking a color while erasing is unambiguously
-        // a "start drawing again" intent.
-        if (drawingOverlay?.mode == DrawingOverlayView.Mode.ERASER) {
-            drawingOverlay?.mode = DrawingOverlayView.Mode.PEN
-        }
         refreshSwatchSelection()
+    }
+
+    private fun selectAnnotationMode(mode: DrawingOverlayView.Mode) {
+        drawingOverlay?.mode = mode
+        refreshAnnotationModeSelection()
+    }
+
+    private fun refreshAnnotationModeSelection() {
+        val mode = drawingOverlay?.mode
+        annotationPenButton?.isSelected = mode == DrawingOverlayView.Mode.PEN
+        annotationEraserButton?.isSelected = mode == DrawingOverlayView.Mode.ERASER
     }
 
     /**
@@ -1654,7 +1837,7 @@ class PinWindowView(
         for ((i, view) in swatchViews.withIndex()) {
             val isActive = i < palette.size && palette[i] == selectedAnnotationColor
             val strokePx = if (isActive) (3 * density).toInt() else (1 * density).toInt()
-            val strokeColor = if (isActive) Color.WHITE else Color.parseColor("#33FFFFFF")
+            val strokeColor = if (isActive) Color.WHITE else "#33FFFFFF".toColorInt()
             (view.background as? android.graphics.drawable.GradientDrawable)?.apply {
                 setStroke(strokePx, strokeColor)
             }
@@ -1666,7 +1849,7 @@ class PinWindowView(
         return View(context).apply {
             background = android.graphics.drawable.GradientDrawable().apply {
                 shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                setColor(Color.parseColor("#22000000"))
+                setColor("#22000000".toColorInt())
                 setSize(dpToPx(1), dpToPx(20))
             }
             layoutParams = LinearLayout.LayoutParams(dpToPx(1), dpToPx(20)).apply {
@@ -1678,12 +1861,13 @@ class PinWindowView(
     }
 
     private fun makeAnnotationActionButton(iconRes: Int, label: String, asCancel: Boolean = false, onClick: () -> Unit): View {
-        val density = resources.displayMetrics.density
         return LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             isClickable = true
             isFocusable = true
+            contentDescription = label
+            tooltipText = label
             layoutParams = LinearLayout.LayoutParams(dpToPx(40), dpToPx(40)).apply {
                 gravity = Gravity.CENTER
             }
@@ -1693,24 +1877,42 @@ class PinWindowView(
                 // background so it reads as "destructive" at a
                 // glance, matching the M3 pattern of using red
                 // for cancel/abort affordances.
-                setColor(if (asCancel) Color.parseColor("#1AEF5350") else Color.parseColor("#00000000"))
+                setColor(if (asCancel) "#1AEF5350".toColorInt() else "#00000000".toColorInt())
             }
             val pressed = android.graphics.drawable.GradientDrawable().apply {
                 shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(if (asCancel) Color.parseColor("#33EF5350") else Color.parseColor("#1F000000"))
+                setColor(if (asCancel) "#33EF5350".toColorInt() else "#1F000000".toColorInt())
+            }
+            val selected = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor("#334488FF".toColorInt())
             }
             background = android.graphics.drawable.StateListDrawable().apply {
                 addState(intArrayOf(android.R.attr.state_pressed), pressed)
+                addState(intArrayOf(android.R.attr.state_selected), selected)
                 addState(intArrayOf(), idle)
             }
-            setOnClickListener { onClick() }
+            setOnTouchListener { view, event ->
+                if (event.actionMasked == MotionEvent.ACTION_DOWN ||
+                    event.actionMasked == MotionEvent.ACTION_UP ||
+                    event.actionMasked == MotionEvent.ACTION_CANCEL
+                ) {
+                    Log.d(TAG, "Annotation action $label: ${MotionEvent.actionToString(event.action)} tool=${event.getToolType(0)}")
+                }
+                // Let View handle click eligibility, cancellation and stylus input.
+                false
+            }
+            setOnClickListener {
+                Log.d(TAG, "Annotation action clicked: $label")
+                onClick()
+            }
             addView(ImageView(context).apply {
                 setImageResource(iconRes)
                 // Cancel icon is the theme's red, to reinforce the
                 // "destructive" meaning; the other action icons
                 // follow the theme's normal icon color.
                 val tint = if (asCancel) {
-                    Color.parseColor("#D32F2F")
+                    "#D32F2F".toColorInt()
                 } else {
                     theme.iconColor
                 }
@@ -1720,31 +1922,21 @@ class PinWindowView(
         }
     }
 
-    /**
-     * Compute the close button's exact screen rectangle (left, top,
-     * right, bottom) by combining the wrapper's window-manager
-     * position with the close button's position inside the
-     * wrapper. The close button is a grandchild of the wrapper
-     * (child of [imageCard]), so its screen bounds depend on
-     * imageCard's offset from the wrapper's window origin.
-     *
-     * Returned as [android.graphics.Rect] in screen pixel
-     * coordinates, suitable for passing to a separate
-     * WindowManager window.
-     */
+    /** Actual screen bounds, including any window-manager inset or cutout offset. */
     fun closeButtonScreenRect(): android.graphics.Rect {
-        val wrapperLp = layoutParams as? WindowManager.LayoutParams
-        val originX = wrapperLp?.x ?: 0
-        val originY = wrapperLp?.y ?: 0
-        // [closeButton] is a child of [imageCard]. imageCard has
-        // gravity TOP | CENTER_HORIZONTAL inside the wrapper, and
-        // closeButton has gravity TOP | END inside imageCard.
-        // To get closeButton's position in the wrapper's
-        // coordinate system, add imageCard.left/top.
-        val left = originX + imageCard.left + closeButton.left
-        val top = originY + imageCard.top + closeButton.top
-        val right = left + closeButton.width
-        val bottom = top + closeButton.height
+        return imageButtonScreenRect(closeButton)
+    }
+
+    fun passthroughButtonScreenRect(): android.graphics.Rect =
+        imageButtonScreenRect(imageActionButtons.first())
+
+    private fun imageButtonScreenRect(button: ImageButton): android.graphics.Rect {
+        val location = IntArray(2)
+        button.getLocationOnScreen(location)
+        val left = location[0]
+        val top = location[1]
+        val right = left + button.width
+        val bottom = top + button.height
         return android.graphics.Rect(left, top, right, bottom)
     }
 
@@ -1827,6 +2019,19 @@ class PinWindowView(
     }
 
     private fun animateToolbarVisibilityChange() {
+        imageActionButtons.forEach { button ->
+            val shown = toolbarShown && !annotationMode &&
+                (button !== imageActionButtons.firstOrNull() || !passthrough)
+            button.isEnabled = shown
+            button.visibility = if (shown) View.VISIBLE else View.INVISIBLE
+            button.bringToFront()
+            button.animate().alpha(if (shown) 1f else 0f).setDuration(SELECTION_ANIM_MS).start()
+        }
+        closeButton.bringToFront()
+        closeButton.isEnabled = toolbarShown
+        closeButton.visibility = if (toolbarShown) View.VISIBLE else View.INVISIBLE
+        toolbarViewport.visibility = if (toolbarShown) View.VISIBLE else View.INVISIBLE
+        if (!annotationMode) applyLayoutSize(currentW, currentH)
         val targetAlpha = if (toolbarShown) 1f else 0f
         val targetTransY = if (toolbarShown) 0f else dpToPx(TOOLBAR_ANIM_TRANSLATE_DP).toFloat()
 
@@ -1835,11 +2040,21 @@ class PinWindowView(
             .setDuration(SELECTION_ANIM_MS)
             .start()
 
-        toolbar.animate()
+        toolbarViewport.animate()
             .alpha(targetAlpha)
             .translationY(targetTransY)
             .setDuration(TOOLBAR_ANIM_MS)
             .start()
+    }
+
+    private fun applyPassthroughActionVisibility() {
+        val button = imageActionButtons.firstOrNull() ?: return
+        val shown = toolbarShown && !annotationMode && !passthrough
+        button.isEnabled = shown
+        button.visibility = if (shown) View.VISIBLE else View.INVISIBLE
+        button.bringToFront()
+        button.animate().cancel()
+        button.alpha = if (shown) 1f else 0f
     }
 
     // ----------------------------------------------------------------
@@ -1859,7 +2074,10 @@ class PinWindowView(
             val cardBottom = cardTop + imageCard.height
             if (x >= cardLeft && x <= cardRight && y >= cardTop && y <= cardBottom) {
                 // Forward to drawing overlay
-                drawingOverlay?.onTouchEvent(event)
+                val localEvent = MotionEvent.obtain(event)
+                localEvent.offsetLocation(-cardLeft, -cardTop)
+                drawingOverlay?.onTouchEvent(localEvent)
+                localEvent.recycle()
                 return true
             }
             // Outside imageCard — let annotation toolbar handle it
@@ -1904,6 +2122,17 @@ class PinWindowView(
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                // Empty wrapper space is not an image drag or selection target.
+                if (event.x < imageCard.left || event.x >= imageCard.right ||
+                    event.y < imageCard.top || event.y >= imageCard.bottom
+                ) return false
+                interacting = true
+                downLayoutX = currentX
+                downLayoutY = currentY
+                gestureStartW = currentW
+                gestureStartH = currentH
+                downTimeMs = event.eventTime
+                dragged = false
                 val cornerIndex = hitTestCorner(event.x, event.y)
                 if (cornerIndex >= 0) {
                     // A locked pin refuses to resize from any corner.
@@ -1916,15 +2145,11 @@ class PinWindowView(
                     // Start a corner drag. See [applyCornerDrag] for the
                     // aspect-preserving geometry.
                     cornerDragIndex = cornerIndex
-                    val anchor = anchorScreenPosition(cornerIndex)
-                    cornerDragAnchorX = anchor.first
-                    cornerDragAnchorY = anchor.second
+                    cornerMoved = false
+                    cornerDragAnchorX = (downLayoutX + if (cornerIndex == CORNER_TL || cornerIndex == CORNER_BL) currentW else 0).toFloat()
+                    cornerDragAnchorY = (downLayoutY + if (cornerIndex == CORNER_TL || cornerIndex == CORNER_TR) currentH else 0).toFloat()
                     cornerDragDownFingerX = event.rawX
                     cornerDragDownFingerY = event.rawY
-                    cornerDragInitialDiagonal = hypot(
-                        event.rawX - anchor.first,
-                        event.rawY - anchor.second,
-                    )
                     cornerDragInitialW = currentW
                     cornerDragInitialH = currentH
                     cornerDragInitialAspect = if (currentH > 0) currentW.toFloat() / currentH.toFloat() else 1f
@@ -1947,7 +2172,12 @@ class PinWindowView(
             }
             MotionEvent.ACTION_MOVE -> {
                 if (cornerDragIndex >= 0) {
-                    applyCornerDrag(event.rawX, event.rawY)
+                    if (!cornerMoved && hypot(
+                            event.rawX - cornerDragDownFingerX,
+                            event.rawY - cornerDragDownFingerY,
+                        ) > ViewConfiguration_getScaledTouchSlop()
+                    ) cornerMoved = true
+                    if (cornerMoved) applyCornerDrag(event.rawX, event.rawY)
                 } else if (!spec.locked) {
                     // Body drag is disabled when locked. The DOWN
                     // handler still set up `downRawX`/etc., so a
@@ -1972,12 +2202,39 @@ class PinWindowView(
                             currentX = cx
                             currentY = cy
                             applyLayoutPosition(cx, cy)
-                            onPositionChanged(cx, cy)
                         }
                     }
                 }
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+            MotionEvent.ACTION_CANCEL -> {
+                cornerDragIndex = NO_CORNER_DRAG
+                interacting = false
+                dragged = false
+                // Resizing the overlay window during a corner drag can
+                // make Android cancel the current touch stream. The
+                // geometry already applied before cancellation is still
+                // valid; restoring the pre-gesture values here makes the
+                // image visibly jump away. Keep the last valid geometry
+                // and persist it just like ACTION_UP.
+                val deferred = deferredSnapshot
+                deferredSnapshot = null
+                if (currentX != downLayoutX || currentY != downLayoutY ||
+                    currentW != gestureStartW || currentH != gestureStartH
+                ) {
+                    deferred?.let { applySnapshot(it.copy(
+                        x = currentX, y = currentY,
+                        width = currentW.toFloat(), height = currentH.toFloat(),
+                    )) }
+                    awaitingGeometryCommit = true
+                    onPositionChanged(currentX, currentY)
+                } else {
+                    deferred?.let(::applySnapshot)
+                }
+                invalidate()
+            }
+            MotionEvent.ACTION_UP -> {
+                val changed = currentX != downLayoutX || currentY != downLayoutY ||
+                    currentW != gestureStartW || currentH != gestureStartH
                 if (cornerDragIndex >= 0) {
                     cornerDragIndex = NO_CORNER_DRAG
                     invalidate()
@@ -1990,6 +2247,20 @@ class PinWindowView(
                     if (dur < TAP_THRESHOLD_MS) {
                         showToolbar(!toolbarShown)
                     }
+                }
+                interacting = false
+                // A completed local gesture supersedes old geometry snapshots.
+                val deferred = deferredSnapshot
+                deferredSnapshot = null
+                if (changed) {
+                    deferred?.let { applySnapshot(it.copy(
+                        x = currentX, y = currentY,
+                        width = currentW.toFloat(), height = currentH.toFloat(),
+                    )) }
+                    awaitingGeometryCommit = true
+                    onPositionChanged(currentX, currentY)
+                } else {
+                    deferred?.let(::applySnapshot)
                 }
                 dragged = false
             }
@@ -2041,6 +2312,10 @@ class PinWindowView(
         // imageCard is the first child at (0,0) with size (currentW, currentH).
         val imgX = localX - imageCard.left
         val imgY = localY - imageCard.top
+        if ((imageActionButtons + closeButton).any {
+                it.visibility == View.VISIBLE && it.isEnabled &&
+                    imgX >= it.left && imgX < it.right && imgY >= it.top && imgY < it.bottom
+            }) return -1
         val positions = arrayOf(
             inset to inset,         // TL
             w - inset to inset,     // TR
@@ -2084,16 +2359,18 @@ class PinWindowView(
     }
 
     private fun anchorScreenPosition(dragIndex: Int): Pair<Float, Float> {
+        val location = IntArray(2)
+        imageCard.getLocationOnScreen(location)
         val x: Float
         val y: Float
         when (dragIndex) {
-            CORNER_TL, CORNER_BL -> x = (currentX + currentW).toFloat()
-            CORNER_TR, CORNER_BR -> x = currentX.toFloat()
+            CORNER_TL, CORNER_BL -> x = (location[0] + currentW).toFloat()
+            CORNER_TR, CORNER_BR -> x = location[0].toFloat()
             else -> x = 0f
         }
         when (dragIndex) {
-            CORNER_TL, CORNER_TR -> y = (currentY + currentH).toFloat()
-            CORNER_BL, CORNER_BR -> y = currentY.toFloat()
+            CORNER_TL, CORNER_TR -> y = (location[1] + currentH).toFloat()
+            CORNER_BL, CORNER_BR -> y = location[1].toFloat()
             else -> y = 0f
         }
         return x to y
@@ -2106,42 +2383,33 @@ class PinWindowView(
         val index = cornerDragIndex
         if (index < 0) return
 
-        val initialDiagonal = cornerDragInitialDiagonal
-        val rawScale = if (initialDiagonal > 0.0001f) {
-            hypot(fingerX - cornerDragAnchorX, fingerY - cornerDragAnchorY) / initialDiagonal
-        } else {
-            1f
-        }
-
         val initialW = cornerDragInitialW.coerceAtLeast(1)
         val initialH = cornerDragInitialH.coerceAtLeast(1)
         val initialWf = initialW.toFloat()
         val initialHf = initialH.toFloat()
-        val minScaleForW = MIN_SIZE.toFloat() / initialWf
-        val minScaleForH = MIN_SIZE.toFloat() / initialHf
+        val dx = (fingerX - cornerDragDownFingerX) * if (index == CORNER_TL || index == CORNER_BL) -1f else 1f
+        val dy = (fingerY - cornerDragDownFingerY) * if (index == CORNER_TL || index == CORNER_TR) -1f else 1f
+        val rawScale = 1f + (dx * initialWf + dy * initialHf) /
+            (initialWf * initialWf + initialHf * initialHf)
+        val minScaleForW = minOf(MIN_SIZE, initialW).toFloat() / initialWf
+        val minScaleForH = minOf(MIN_SIZE, initialH).toFloat() / initialHf
         val maxScaleForW = MAX_SIZE.toFloat() / initialWf
         val maxScaleForH = MAX_SIZE.toFloat() / initialHf
-        val minScale = maxOf(minScaleForW, minScaleForH)
         val maxScale = minOf(maxScaleForW, maxScaleForH)
+        val minScale = minOf(maxOf(minScaleForW, minScaleForH), maxScale)
         val scaleFactor = rawScale.coerceIn(minScale, maxScale)
 
         // Compute new dimensions preserving the initial aspect ratio exactly.
         // Use the aspect ratio captured at drag start so that floating-point
         // drift from repeated toInt() truncation does not accumulate.
-        val aspect = cornerDragInitialAspect
-        var newWf = initialWf * scaleFactor
-        var newHf = newWf / aspect
-        // Clamp to size limits while preserving aspect ratio.
-        if (newWf < MIN_SIZE) { newWf = MIN_SIZE.toFloat(); newHf = newWf / aspect }
-        if (newHf < MIN_SIZE) { newHf = MIN_SIZE.toFloat(); newWf = newHf * aspect }
-        if (newWf > MAX_SIZE) { newWf = MAX_SIZE.toFloat(); newHf = newWf / aspect }
-        if (newHf > MAX_SIZE) { newHf = MAX_SIZE.toFloat(); newWf = newHf * aspect }
+        val newWf = initialWf * scaleFactor
+        val newHf = initialHf * scaleFactor
 
-        val newW = newWf.toInt()
-        val newH = newHf.toInt()
+        val newW = newWf.roundToInt().coerceAtLeast(1)
+        val newH = newHf.roundToInt().coerceAtLeast(1)
 
-        val newX: Int
-        val newY: Int
+        var newX: Int
+        var newY: Int
         when (index) {
             CORNER_TL -> {
                 newX = (cornerDragAnchorX - newW).toInt()
@@ -2161,7 +2429,13 @@ class PinWindowView(
             }
             else -> return
         }
-
+        // Corner drags used to bypass the same bounds check as body drags.
+        // When a finger crossed a screen edge, the resulting WindowManager
+        // coordinates could move most of the pin off-screen and look like
+        // the image had jumped away. Keep the resize visible as well.
+        val (clampedX, clampedY) = clampToScreen(newX, newY, newW, newH)
+        newX = clampedX
+        newY = clampedY
         if (newW != currentW || newH != currentH || newX != currentX || newY != currentY) {
             currentW = newW
             currentH = newH
@@ -2169,8 +2443,6 @@ class PinWindowView(
             currentY = newY
             applyLayoutSize(newW, newH)
             applyLayoutPosition(newX, newY)
-            onSizeChanged(newW.toFloat(), newH.toFloat())
-            onPositionChanged(newX, newY)
             invalidate()
         }
     }
@@ -2188,10 +2460,11 @@ class PinWindowView(
         // Wrapper height = image + gap + toolbar — clamp on the
         // wrapper so we never push the toolbar entirely off-screen
         // (the user might still want to see it / tap it).
-        val toolbarOverhead = dpToPx(TOOLBAR_GAP_DP) + dpToPx(TOOLBAR_HEIGHT_DP)
+        val toolbarOverhead = dpToPx(TOOLBAR_GAP_DP) + toolbarRows(w) * dpToPx(TOOLBAR_HEIGHT_DP)
         val wrapperH = h + toolbarOverhead
-        val maxX = bounds.right - w / 4
-        val minX = -w + w / 4
+        val wrapperW = maxOf(w, toolbarWidth())
+        val maxX = bounds.right - wrapperW / 4
+        val minX = -wrapperW + wrapperW / 4
         val maxY = bounds.bottom - wrapperH / 4
         val minY = -wrapperH + wrapperH / 4
         return x.coerceIn(minX, maxX) to y.coerceIn(minY, maxY)
@@ -2202,15 +2475,50 @@ class PinWindowView(
         lp.x = x
         lp.y = y
         runCatching { windowManager.updateViewLayout(this, lp) }
+        onLayoutChanged()
     }
 
     internal fun updateLayoutFromExternal(x: Int, y: Int) {
+        if (annotationMode) return
         currentX = x
         currentY = y
         applyLayoutPosition(x, y)
     }
 
+    internal fun applySnapshot(entity: PinEntity) {
+        if (annotationMode || interacting) {
+            deferredSnapshot = entity
+            return
+        }
+        val geometryMatches = currentX == entity.x && currentY == entity.y &&
+            currentW == entity.width.toInt() && currentH == entity.height.toInt()
+        if (geometryMatches) awaitingGeometryCommit = false
+        if (!awaitingGeometryCommit) {
+            if (currentX != entity.x || currentY != entity.y) updateLayoutFromExternal(entity.x, entity.y)
+            if (currentW != entity.width.toInt() || currentH != entity.height.toInt()) {
+                updateSizeFromExternal(entity.width.toInt(), entity.height.toInt())
+            }
+        }
+        if (spec.locked != entity.locked) setLockedVisual(entity.locked)
+        if (spec.rotation != entity.rotation) applyRotation(entity.rotation)
+        if (spec.flipped != entity.flipped) applyFlip(entity.flipped)
+        val imageChanged = spec.imageUri != entity.imageUri
+        spec.imageUri = entity.imageUri
+        if (spec.annotatedImageUri != entity.annotatedImageUri) {
+            setAnnotatedImageUri(entity.annotatedImageUri)
+        } else if (imageChanged) {
+            loadImage(spec.annotatedImageUri ?: entity.imageUri)
+        }
+        setSerialVisible(entity.serialVisible, entity.zOrder)
+        updateZOrder(entity.zOrder)
+    }
+
+    internal fun geometryCommitFailed() {
+        awaitingGeometryCommit = false
+    }
+
     internal fun updateSizeFromExternal(w: Int, h: Int) {
+        if (annotationMode) return
         currentW = w
         currentH = h
         applyLayoutSize(w, h)
@@ -2218,16 +2526,12 @@ class PinWindowView(
 
     private fun applyLayoutSize(w: Int, h: Int) {
         val lp = layoutParams as? WindowManager.LayoutParams ?: return
-        val toolbarOverhead = dpToPx(TOOLBAR_GAP_DP) + dpToPx(TOOLBAR_HEIGHT_DP)
-        // Wrapper is always at least minToolbarW wide, mirroring the
-        // initial-layout logic. Resizing the image below that
-        // threshold widens the wrapper so the toolbar (centered) can
-        // extend past the image's left/right edges without being
-        // clipped.
-        val minToolbarW = dpToPx(MIN_TOOLBAR_WIDTH_DP)
-        val wrapperW = maxOf(w, minToolbarW)
-        lp.width = wrapperW
-        lp.height = h + toolbarOverhead
+        arrangeImageActions(w)
+        arrangeToolbar(w)
+        val toolbarHeight = toolbarRows(w) * dpToPx(TOOLBAR_HEIGHT_DP)
+        val toolbarOverhead = dpToPx(TOOLBAR_GAP_DP) + toolbarHeight
+        lp.width = maxOf(w, toolbarWidth())
+        lp.height = h + if (toolbarShown) toolbarOverhead else 0
         runCatching { windowManager.updateViewLayout(this, lp) }
         // Sync the imageCard dimensions so the image scales rather
         // than gets clipped. Without this the imageCard stays at its
@@ -2240,21 +2544,22 @@ class PinWindowView(
         // bottom. The toolbar uses WRAP_CONTENT, so we only need to
         // update its topMargin — the width is computed from its
         // children and stays compact.
-        (toolbar.layoutParams as? FrameLayout.LayoutParams)?.apply {
+        (toolbarViewport.layoutParams as? FrameLayout.LayoutParams)?.apply {
             topMargin = h + dpToPx(TOOLBAR_GAP_DP)
+            height = toolbarHeight
         }
         // Mutating layoutParams alone doesn't trigger a re-layout on
         // most Android versions — the child keeps its old measured
         // size until something forces a measure pass. Explicitly
         // request a layout on the affected children.
         imageCard.requestLayout()
-        toolbar.requestLayout()
-        // Re-apply the current rotation so the swapped imageView
-        // layoutParams (set in [applyRotation]) pick up the new
-        // imageCard size. Without this, rotating-then-resizing would
-        // leave the imageView with stale swapped dimensions and
-        // re-introduce the blue-band gap.
-        if (imageView.rotation != 0f) applyRotation(imageView.rotation.toInt())
+        toolbarViewport.requestLayout()
+        // Re-render the rotated bitmap against the (potentially
+        // new) source dimensions, in case the user resized from a
+        // corner handle after rotating. Without this the rotated
+        // bitmap would be the one generated against the pre-resize
+        // card size and might look low-res on the new, larger card.
+        applyCurrentRotation()
         // Keep the passthrough indicator aligned to the imageCard
         // bounds so the orange outline always hugs the visible
         // image, even after the user resizes from a corner.
@@ -2271,6 +2576,9 @@ class PinWindowView(
             height = h
         }
         lockedIndicator.requestLayout()
+        // Child positions (including the passthrough action button) are
+        // resolved during the next layout pass, so notify after that pass.
+        postOnAnimation { onLayoutChanged() }
     }
 
     private fun dpToPx(dp: Float): Int =
@@ -2289,7 +2597,7 @@ class PinWindowView(
         private const val MAX_SIZE = 4096
 
         // Corner-handle geometry (see [applyCornerDrag]).
-        private const val CORNER_HIT_RADIUS_DP = 40f
+        private const val CORNER_HIT_RADIUS_DP = 24f
         private const val HANDLE_RADIUS_DP = 7f
         private const val HANDLE_STROKE_DP = 2f
 
@@ -2308,12 +2616,12 @@ class PinWindowView(
         val ANNOTATION_SWATCH_COLORS: IntArray = intArrayOf(
             Color.RED,
             Color.BLACK,
-            Color.parseColor("#FF9800"), // orange
-            Color.parseColor("#FFEB3B"), // yellow
-            Color.parseColor("#4CAF50"), // green
-            Color.parseColor("#00BCD4"), // cyan
-            Color.parseColor("#2196F3"), // blue
-            Color.parseColor("#9C27B0"), // purple
+            "#FF9800".toColorInt(), // orange
+            "#FFEB3B".toColorInt(), // yellow
+            "#4CAF50".toColorInt(), // green
+            "#00BCD4".toColorInt(), // cyan
+            "#2196F3".toColorInt(), // blue
+            "#9C27B0".toColorInt(), // purple
         )
 
         // Layout measurements.
@@ -2321,14 +2629,6 @@ class PinWindowView(
         private const val TOOLBAR_HEIGHT_DP = 40f
         private const val TOOLBAR_GAP_DP = 4f
         private const val TOOLBAR_BUTTON_DP = 40f
-        // Toolbar content width at design size: 9 buttons × 40dp +
-        // 4 dividers × 1dp. The wrapper is widened to at least this
-        // many pixels so the toolbar never gets clipped on narrow
-        // pins.
-        // 10 icon buttons (40dp each) + 5 dividers (1dp each).
-        // The wrapper must be at least this wide so the toolbar
-        // pill can fit without clipping its rightmost button.
-        private const val MIN_TOOLBAR_WIDTH_DP = 10 * 40f + 5 * 1f
         private const val CLOSE_BUTTON_SIZE_DP = 40f
         private const val CLOSE_BUTTON_MARGIN_DP = 8f
 

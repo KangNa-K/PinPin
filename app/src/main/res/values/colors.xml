@@ -29,8 +29,6 @@
         system picks the right file based on the device's UI mode.
     -->
     <color name="pinpin_background">#F8F8FA</color>
-    <color name="pinpin_surface">#FFFFFF</color>
-    <color name="pinpin_on_surface">#1F1F23</color>
 
     <!-- 浅色主题（悬浮 pin UI 表面） -->
     <color name="pin_surface_fill_light">#CCFFFFFF</color>
@@ -46,10 +44,9 @@
     <color name="pin_lock_active_red">#D32F2F</color>
 
     <!-- 锁定状态边框：保持红色提示 -->
-    <color name="pin_lock_indicator_red">#E53935</color>
 
     <!-- 穿透状态边框：保持橙色提示 -->
-    <color name="pin_passthrough_indicator_orange">#80FF6F00</color>
 
+    <color name="ic_launcher_background">#7768E8</color>
 </resources>
 

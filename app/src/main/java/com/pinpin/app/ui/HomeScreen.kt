@@ -7,7 +7,17 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import androidx.core.net.toUri
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.BackHandler
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.DisposableEffect
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -43,16 +53,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.Layers
-import androidx.compose.material.icons.filled.PhotoLibrary
-import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.material.icons.filled.Warning
@@ -81,17 +87,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.flow.collect
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.pinpin.app.R
@@ -114,24 +123,79 @@ import java.util.Locale
  * [HomeViewModel] is responsible for triggering the mutators (insert,
  * delete) on user actions.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
     viewModel: HomeViewModel = hiltViewModel(),
 ) {
     val context = LocalContext.current
+    val updater = remember(context) {
+        (context.applicationContext as com.pinpin.app.PinApplication).appUpdateController
+    }
+    val updateState by updater.state.collectAsStateWithLifecycle()
+    com.pinpin.app.update.AppUpdateNotice(updater)
     val scope = rememberCoroutineScope()
-    val pins by PinWindowManager.pins.collectAsState()
-    val history by viewModel.history.collectAsState()
+    val storedPins by viewModel.pins.collectAsStateWithLifecycle()
+    val pins = storedPins.map {
+        PinWindowManager.PinState(it.id, "钉图 ${it.zOrder}", it.width, it.height,
+            it.x, it.y, it.locked, it.annotatedImageUri ?: it.imageUri, it.sourceType, it.zOrder)
+    }
+    val history by viewModel.history.collectAsStateWithLifecycle()
+    val operation by viewModel.operation.collectAsStateWithLifecycle()
+    val message by viewModel.message.collectAsStateWithLifecycle()
+    val importsInFlight by viewModel.importsInFlight.collectAsStateWithLifecycle()
+    var tab by rememberSaveable { mutableStateOf(0) }
+    var pendingAction by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingHistoryIds by rememberSaveable { mutableStateOf(arrayListOf<String>()) }
+    var overlayGranted by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner, viewModel) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.RESUMED) {
+            viewModel.overlayStartRequested.collect { requested ->
+                if (requested) {
+                    viewModel.consumeOverlayStartRequest()
+                    if (Settings.canDrawOverlays(context)) {
+                        try {
+                            com.pinpin.app.overlay.PinOverlayService.start(context)
+                            viewModel.startOverlaySync()
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                            throw cancelled
+                        } catch (error: Exception) {
+                            viewModel.reportMessage("图片已保存，但悬浮服务启动失败：${error.message}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun withOverlay(action: String, block: () -> Unit) {
+        if (Settings.canDrawOverlays(context)) {
+            try {
+                block()
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                viewModel.reportMessage("无法打开所选功能：${error.message}")
+            }
+        } else {
+            pendingAction = action
+            try {
+                openOverlaySettings(context)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                pendingAction = null
+                viewModel.reportMessage("无法打开权限设置：${error.message}")
+            }
+        }
+    }
 
     val pickImageLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia(),
     ) { uri: Uri? ->
         if (uri != null) {
-            scope.launch {
-                ensureOverlayPermissionAsync(context) {
-                    viewModel.addPinFromUri(uri, "photopicker")
-                }
-            }
+            viewModel.addPinFromUri(uri, "photopicker")
         }
     }
 
@@ -168,15 +232,20 @@ fun HomeScreen(
             val offsetY = data.getFloatExtra(
                 com.pinpin.app.ball.BallImageAdjustActivity.EXTRA_RESULT_OFFSET_Y, 0f,
             )
-            scope.launch {
-                ensureOverlayPermissionAsync(context) {
+            try {
+                if (Settings.canDrawOverlays(context)) {
                     // The ball service may not be running yet (e.g.
                     // the user skipped onboarding in a previous
                     // session). Start it first so the SET_BALL_IMAGE
                     // action has a target. start() is idempotent.
                     BallService.start(context)
                     BallService.setBallImage(context, uri, scale, offsetX, offsetY)
+                } else {
+                    viewModel.reportMessage("悬浮窗权限已撤销，请授权后重新选择悬浮球图片")
                 }
+            } catch (error: Exception) {
+                if (error is kotlinx.coroutines.CancellationException) throw error
+                viewModel.reportMessage("设置悬浮球失败：${error.message}")
             }
         }
     }
@@ -191,8 +260,10 @@ fun HomeScreen(
         contract = ActivityResultContracts.OpenDocument(),
     ) { uri: Uri? ->
         if (uri != null) {
-            scope.launch {
-                ensureOverlayPermissionAsync(context) {
+            try {
+                    context.contentResolver.takePersistableUriPermission(
+                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                    )
                     val intent = android.content.Intent(
                         context, com.pinpin.app.ball.BallImageAdjustActivity::class.java,
                     ).apply {
@@ -202,38 +273,119 @@ fun HomeScreen(
                         )
                     }
                     ballImageAdjustLauncher.launch(intent)
-                }
+            } catch (error: Exception) {
+                if (error is kotlinx.coroutines.CancellationException) throw error
+                viewModel.reportMessage("无法读取悬浮球图片：${error.message ?: "请重新选择"}")
             }
         }
     }
 
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission(),
-    ) { /* ignore result; service will still run with whatever permission state */ }
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                overlayGranted = Settings.canDrawOverlays(context)
+                val action = pendingAction
+                pendingAction = null
+                try {
+                  if (overlayGranted) {
+                    when (action) {
+                        "image" -> pickImageLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                        "ball" -> pickBallImageLauncher.launch(arrayOf("image/*"))
+                        "repin" -> {
+                            val ids = pendingHistoryIds.toSet()
+                            val available = viewModel.history.value.filter { it.id in ids }
+                            if (available.size == ids.size) viewModel.repinManyFromHistory(available)
+                            else viewModel.reportMessage("待处理历史已变化，请重新选择")
+                        }
+                    }
+                } else if (action != null) {
+                    viewModel.reportMessage("未授予悬浮窗权限，仍可浏览和删除历史")
+                  }
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    viewModel.reportMessage("无法继续待处理操作：${error.message}")
+                }
+                pendingHistoryIds = arrayListOf()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
-    Column(
+    if (message != null) {
+        AlertDialog(
+            onDismissRequest = viewModel::dismissMessage,
+            title = { Text("操作提示") },
+            text = { Text(message.orEmpty()) },
+            confirmButton = { TextButton(onClick = viewModel::dismissMessage) { Text("知道了") } },
+        )
+    }
+
+    androidx.compose.foundation.layout.BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
             .systemBarsPadding(),
     ) {
-        AccessibilityStatusBanner()
-        HomeHeader(count = pins.size)
+        val compact = maxHeight < 500.dp
+        Column(Modifier.fillMaxSize()) {
+        if (compact) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("钉图", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                TextButton(onClick = {
+                    context.startActivity(com.pinpin.app.a11y.PinAccessibilityService.buildSettingsIntent())
+                }) { Text("截图权限") }
+            }
+        } else {
+            AccessibilityStatusBanner()
+            HomeHeader(count = pins.size)
+        }
+        if (importsInFlight > 0) {
+            Text("正在保存 $importsInFlight 张导入图片…", style = MaterialTheme.typography.bodySmall)
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        }
+        if (!overlayGranted && !compact) {
+            TextButton(onClick = { openOverlaySettings(context) }) {
+                Text("悬浮窗未授权 · 历史可用，钉图暂不显示")
+            }
+        }
+        if (operation.total > 0) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("${operation.title} ${operation.results.size}/${operation.total}", Modifier.weight(1f))
+                if (!operation.running) TextButton(onClick = viewModel::dismissResults) { Text("收起") }
+            }
+            if (operation.running) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = if (compact) 48.dp else 100.dp)) {
+                items(operation.results) { result ->
+                    Text("${result.label.take(12)}：${result.message}${if (result.partial) "（部分完成）" else ""}",
+                        color = if (result.succeeded) MaterialTheme.colorScheme.onSurface
+                        else MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+        androidx.compose.material3.PrimaryTabRow(selectedTabIndex = tab) {
+            Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("当前钉图 (${pins.size})") })
+            Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("历史 (${history.size})") })
+        }
 
         // History section takes whatever space is left between
         // the header, the (optional) active-pin list and the
         // action bar at the bottom — so the screenshot grid
         // fills the previously-empty middle of the screen
         // instead of being a one-row LazyRow.
-        HistorySection(
+        if (tab == 1) HistorySection(
             items = history,
             onRepin = { item ->
-                ensureOverlayPermissionAsync(context) {
+                pendingHistoryIds = arrayListOf(item.id)
+                withOverlay("repin") {
                     viewModel.repinFromHistory(item)
                 }
             },
             onRepinMany = { items ->
-                ensureOverlayPermissionAsync(context) {
+                pendingHistoryIds = ArrayList(items.map { it.id })
+                withOverlay("repin") {
                     viewModel.repinManyFromHistory(items)
                 }
             },
@@ -242,30 +394,21 @@ fun HomeScreen(
             modifier = Modifier.weight(1f, fill = true),
         )
 
-        if (pins.isEmpty()) {
-            EmptyState()
-        } else {
-            PinList(
-                pins = pins,
-                onClose = { id -> scope.launch { viewModel.removePin(id) } },
-            )
+        if (tab == 0) Box(Modifier.weight(1f).fillMaxWidth()) {
+            if (pins.isEmpty()) {
+                EmptyState()
+            } else {
+                PinList(pins = pins, onClose = viewModel::removePin)
+            }
         }
 
         HomeActionBar(
             onPickImage = {
-                scope.launch {
-                    ensureOverlayPermissionAsync(context) {
-                        pickImageLauncher.launch(
-                            PickVisualMediaRequest(
-                                ActivityResultContracts.PickVisualMedia.ImageOnly,
-                            ),
-                        )
-                    }
-                }
+                pickImageLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
             },
             onPickBallImage = {
                 scope.launch {
-                    ensureOverlayPermissionAsync(context) {
+                    withOverlay("ball") {
                         // image/* — the user can pick any picture;
                         // we resize to a 2× ball on the service side.
                         pickBallImageLauncher.launch(arrayOf("image/*"))
@@ -273,11 +416,21 @@ fun HomeScreen(
                 }
             },
             onClearBallImage = {
-                BallService.start(context)
-                BallService.clearBallImage(context)
+                try {
+                    if (Settings.canDrawOverlays(context)) {
+                        BallService.start(context)
+                        BallService.clearBallImage(context)
+                    } else viewModel.reportMessage("请先授予悬浮窗权限")
+                } catch (error: Exception) {
+                    if (error is kotlinx.coroutines.CancellationException) throw error
+                    viewModel.reportMessage("重置悬浮球失败：${error.message}")
+                }
             },
             onGrantOverlay = { openOverlaySettings(context) },
+            onCheckUpdate = { updater.check() },
+            checkingUpdate = updateState.checking,
         )
+        }
     }
 }
 
@@ -295,7 +448,28 @@ fun HomeScreen(
 @Composable
 private fun AccessibilityStatusBanner() {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     var isHealthy by remember { mutableStateOf(isA11yServiceHealthy(context)) }
+
+    // Re-check on every ON_RESUME. Without this the banner stays
+    // stuck on the initial value forever — the user enables a11y
+    // in Settings → comes back to the app → the banner still says
+    // "未启用无障碍服务" because Compose's `remember` doesn't
+    // re-run on Activity resume, only on first composition. The
+    // OnboardingActivity has the equivalent fix at the Activity
+    // level (`onResume → triggerRefresh → refreshTick`); HomeScreen
+    // is Compose-only so we have to wire the lifecycle observer
+    // here.
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                isHealthy = isA11yServiceHealthy(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     if (isHealthy) return
 
     androidx.compose.material3.Surface(
@@ -331,12 +505,12 @@ private fun AccessibilityStatusBanner() {
             Spacer(modifier = Modifier.width(10.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "未启用无障碍服务",
+                    text = stringResource(R.string.a11y_status_banner_title),
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
                 )
                 Text(
-                    text = "点击前往 设置 → 辅助功能 → 钉图，启用后可恢复截图功能",
+                    text = stringResource(R.string.a11y_status_banner_body),
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
@@ -420,7 +594,7 @@ private fun EmptyState() {
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Icon(
-                imageVector = Icons.Filled.Layers,
+                painter = painterResource(R.drawable.ic_pin_layers),
                 contentDescription = "暂无钉图",
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.size(56.dp),
@@ -476,10 +650,12 @@ private fun PinRow(
                     .background(MaterialTheme.colorScheme.surfaceVariant),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(
-                    imageVector = Icons.Filled.Image,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                AsyncImage(
+                    model = pin.imageUri,
+                    contentDescription = "钉图缩略图",
+                    contentScale = ContentScale.Crop,
+                    error = painterResource(R.drawable.ic_pin_image),
+                    modifier = Modifier.fillMaxSize(),
                 )
             }
             Spacer(modifier = Modifier.width(12.dp))
@@ -520,109 +696,46 @@ private fun HomeActionBar(
     onPickBallImage: () -> Unit,
     onClearBallImage: () -> Unit,
     onGrantOverlay: () -> Unit,
+    onCheckUpdate: () -> Unit,
+    checkingUpdate: Boolean,
 ) {
-    // Single Material3 Card with 3 logical rows:
-    //   1. Primary action (Filled tonal button, full width).
-    //   2. Ball-image row: two compact tonal buttons side-by-side.
-    //   3. Footer: low-emphasis text button.
-    // Folding the 4 actions into a single card saves ~60dp of
-    // vertical space versus the old stacked full-width column.
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp),
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
-        ),
+    var menuOpen by remember { mutableStateOf(false) }
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            // Primary: pick image from gallery.
-            FilledTonalButton(
-                onClick = onPickImage,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(14.dp),
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.Image,
-                    contentDescription = null,
-                    modifier = Modifier.size(20.dp),
+        FilledTonalButton(onClick = onPickImage, modifier = Modifier.weight(1f)) {
+            Icon(painterResource(R.drawable.ic_pin_image), contentDescription = null, Modifier.size(20.dp))
+            Spacer(Modifier.width(8.dp))
+            Text(stringResource(R.string.home_action_pick_image))
+        }
+        Box {
+            IconButton(onClick = { menuOpen = true }) {
+                Icon(Icons.Filled.MoreVert, contentDescription = "更多设置")
+            }
+            androidx.compose.material3.DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text(if (checkingUpdate) "正在检查更新…" else "检查更新") },
+                    leadingIcon = { Icon(Icons.Filled.Refresh, contentDescription = null) },
+                    enabled = !checkingUpdate,
+                    onClick = { menuOpen = false; onCheckUpdate() },
                 )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(stringResource(R.string.home_action_pick_image))
-            }
-
-            // Ball-image controls on one row, equal weight.
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                FilledTonalButton(
-                    onClick = onPickBallImage,
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(14.dp),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.Layers,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp),
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = stringResource(R.string.home_action_pick_ball_image),
-                        maxLines = 1,
-                    )
-                }
-                FilledTonalButton(
-                    onClick = onClearBallImage,
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(14.dp),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.Refresh,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp),
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = stringResource(R.string.home_action_reset_ball_image),
-                        maxLines = 1,
-                    )
-                }
-            }
-
-            // Footer: secondary permission action as a centered text button.
-            TextButton(
-                onClick = onGrantOverlay,
-                modifier = Modifier
-                    .align(Alignment.CenterHorizontally),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-            ) {
-                Text(
-                    text = stringResource(R.string.home_action_grant_overlay),
-                    style = MaterialTheme.typography.labelLarge,
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text(stringResource(R.string.home_action_pick_ball_image)) },
+                    onClick = { menuOpen = false; onPickBallImage() },
+                )
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text(stringResource(R.string.home_action_reset_ball_image)) },
+                    onClick = { menuOpen = false; onClearBallImage() },
+                )
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text(stringResource(R.string.home_action_grant_overlay)) },
+                    onClick = { menuOpen = false; onGrantOverlay() },
                 )
             }
         }
     }
-}
-
-private fun ensureOverlayPermissionAsync(context: Context, onGranted: () -> Unit) {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
-        !Settings.canDrawOverlays(context)
-    ) {
-        openOverlaySettings(context)
-        return
-    }
-    onGranted()
 }
 
 // ----------------------------------------------------------------
@@ -657,6 +770,26 @@ private fun HistorySection(
     // section so the selection state lives as long as the user
     // is on the home screen — leaving and returning clears it.
     var selectedIds by remember { mutableStateOf<Set<String>?>(null) }
+    var deleteConfirmation by remember { mutableStateOf<List<String>?>(null) }
+    BackHandler(enabled = selectedIds != null) { selectedIds = null }
+    LaunchedEffect(items) {
+        selectedIds = selectedIds?.intersect(items.map { it.id }.toSet())
+    }
+    deleteConfirmation?.let { ids ->
+        AlertDialog(
+            onDismissRequest = { deleteConfirmation = null },
+            title = { Text("删除 ${ids.size} 张历史图片？") },
+            text = { Text("删除后无法恢复，已有钉图不受影响。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    onDeleteMany(ids)
+                    deleteConfirmation = null
+                    selectedIds = null
+                }) { Text("删除") }
+            },
+            dismissButton = { TextButton(onClick = { deleteConfirmation = null }) { Text("取消") } },
+        )
+    }
     val inMultiSelect = selectedIds != null
     // Convenience: the subset of the list that is currently
     // selected, so the bottom bar's "全部重新钉" can pass
@@ -694,7 +827,7 @@ private fun HistorySection(
                 navigationIcon = {
                     IconButton(onClick = { selectedIds = null }) {
                         Icon(
-                            imageVector = Icons.Filled.ArrowBack,
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "取消多选",
                         )
                     }
@@ -731,7 +864,7 @@ private fun HistorySection(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Icon(
-                    imageVector = Icons.Filled.PhotoLibrary,
+                    painter = painterResource(R.drawable.ic_pin_photo_library),
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -806,8 +939,7 @@ private fun HistorySection(
                     val current = selectedIds ?: emptySet()
                     IconButton(
                         onClick = {
-                            onDeleteMany(current.toList())
-                            selectedIds = null
+                            deleteConfirmation = selectedItems.map { it.id }
                         },
                         enabled = current.isNotEmpty(),
                     ) {
@@ -825,7 +957,7 @@ private fun HistorySection(
                         enabled = current.isNotEmpty(),
                     ) {
                         Icon(
-                            imageVector = Icons.Filled.PushPin,
+                            painter = painterResource(R.drawable.ic_pin_push_pin),
                             contentDescription = "全部重新钉",
                         )
                     }
@@ -932,17 +1064,23 @@ private fun HistoryThumb(
     }
 }
 
-private val historyDateFormat = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
-
 private fun formatTimestamp(epochMs: Long): String =
-    historyDateFormat.format(Date(epochMs))
+    SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(epochMs))
 
 private fun openOverlaySettings(context: Context) {
     val intent = Intent(
         Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-        Uri.parse("package:${context.packageName}"),
+        "package:${context.packageName}".toUri(),
     ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    context.startActivity(intent)
+    try {
+        context.startActivity(intent)
+    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        android.widget.Toast.makeText(
+            context, "无法打开悬浮窗设置，请在系统设置中手动授权", android.widget.Toast.LENGTH_LONG,
+        ).show()
+    }
 }
 
 private fun requestNotificationPermissionIfNeeded(

@@ -1,0 +1,8 @@
+{
+  "versionCode": 7,
+  "versionName": "1.0.4",
+  "apkUrl": "https://api.github.com/repos/KangNa-K/PinPin-updates/releases/assets/630382030",
+  "sha256": "074049e8441f4ae0c321d12305d52c2fa23a4d44330320cd7a04904cdeec9129",
+  "size": 4598285,
+  "notes": "优化智能形状识别，提升三角形、正方形和长方形的识别稳定性；修复图模式悬浮工具栏自动换行，始终保持单行显示；修复穿透按钮在移动、缩放和系统窗口坐标变化时发生偏移。"
+}

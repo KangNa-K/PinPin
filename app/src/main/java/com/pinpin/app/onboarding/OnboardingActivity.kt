@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import androidx.core.net.toUri
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -40,6 +41,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -95,7 +97,7 @@ class OnboardingActivity : ComponentActivity() {
             triggerRefresh()
         }
 
-    private var refreshTick by mutableStateOf(0)
+    private var refreshTick by mutableIntStateOf(0)
 
     private fun triggerRefresh() { refreshTick++ }
 
@@ -155,13 +157,13 @@ class OnboardingActivity : ComponentActivity() {
     private fun requestOverlay() {
         val intent = Intent(
             Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-            android.net.Uri.parse("package:$packageName"),
+            "package:$packageName".toUri(),
         )
         overlayLauncher.launch(intent)
     }
 
     private fun requestAccessibility() {
-        startActivity(PinAccessibilityService.buildSettingsIntent(this))
+        startActivity(PinAccessibilityService.buildSettingsIntent())
     }
 
     private fun launchBallAndFinish() {
@@ -170,9 +172,22 @@ class OnboardingActivity : ComponentActivity() {
         // possibly triggers a capture. Both must be started from
         // an Activity context (not Application.onCreate) to avoid
         // ForegroundServiceStartNotAllowedException on Android 12+.
-        PinOverlayService.start(this)
-        pinRepository.startOverlaySync()
-        BallService.start(this)
+        try {
+            if (Settings.canDrawOverlays(this)) {
+                PinOverlayService.start(this)
+                pinRepository.startOverlaySync()
+                if (PinAccessibilityService.isEnabled(this)) BallService.start(this)
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            android.widget.Toast.makeText(
+                this, "悬浮服务暂不可用：${error.message}", android.widget.Toast.LENGTH_LONG,
+            ).show()
+        }
+        startActivity(Intent(this, com.pinpin.app.ui.MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        })
         finish()
     }
 }
@@ -197,8 +212,8 @@ private fun WizardContent(
     val a11yGranted = remember(refreshTick) { PinAccessibilityService.isEnabled(context) }
 
     // Step 0 = welcome, 1..3 = permission steps, 4 = done.
-    var step by remember { mutableStateOf(0) }
-    LaunchedEffect(notifGranted, overlayGranted, a11yGranted) {
+    var step by androidx.compose.runtime.saveable.rememberSaveable { mutableIntStateOf(0) }
+    LaunchedEffect(step, notifGranted, overlayGranted, a11yGranted) {
         // Auto-advance when current step is granted.
         when (step) {
             1 -> if (notifGranted) step = 2
@@ -214,6 +229,9 @@ private fun WizardContent(
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
         StepIndicator(current = step, total = 4)
+        androidx.compose.material3.TextButton(onClick = onFinish) {
+            Text("暂不设置，浏览首页")
+        }
         when (step) {
             0 -> WelcomeStep(onNext = { step = if (notifGranted) 2 else 1 })
             1 -> PermissionStep(
@@ -361,6 +379,9 @@ private fun PermissionStep(
                 shape = RoundedCornerShape(14.dp),
             ) {
                 Text(actionLabel)
+            }
+            androidx.compose.material3.TextButton(onClick = onSkip) {
+                Text("暂时跳过")
             }
         } else {
             Button(

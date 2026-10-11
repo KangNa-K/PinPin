@@ -5,9 +5,7 @@
     <!-- HomeScreen -->
     <string name="home_title">钉图</string>
     <string name="home_subtitle_empty">还没有钉图 · 点下面按钮试试</string>
-    <string name="home_action_add_test">添加测试悬浮窗</string>
     <string name="home_action_pick_image">从相册选择</string>
-    <string name="home_action_capture">应用内截图</string>
     <string name="home_action_pick_ball_image">更换悬浮球图片</string>
     <string name="home_action_reset_ball_image">恢复默认悬浮球</string>
     <string name="home_action_grant_overlay">授权显示悬浮窗</string>
@@ -32,8 +30,8 @@
     <!-- Accessibility status banner shown when the a11y service
          is enabled but its process is not running. Tapping the
          banner deep-links to the a11y settings screen. -->
-    <string name="a11y_status_banner_title">无障碍服务未运行</string>
-    <string name="a11y_status_banner_body">点击前往 设置 → 辅助功能 → 钉图，关闭再打开一次以恢复截图功能</string>
+    <string name="a11y_status_banner_title">未启用无障碍服务</string>
+    <string name="a11y_status_banner_body">点击前往 设置 → 辅助功能 → 钉图，启用后可恢复截图功能</string>
     <string name="a11y_run_capture_failed">无障碍服务未响应。请到 设置 → 辅助功能 → 钉图，关闭再打开一次以恢复截图功能</string>
 
     <!-- Ball image adjust activity (launched after picking a new ball image) -->
@@ -41,8 +39,7 @@
     <string name="ball_adjust_cancel">取消</string>
     <string name="ball_adjust_reset">重置</string>
     <string name="ball_adjust_save">保存</string>
-    <string name="ball_adjust_hint_drag">拖动图片调整位置</string>
-    <string name="ball_adjust_hint_pinch">双指捏合可缩放</string>
+    <string name="ball_adjust_actual_size">（实际 48dp）</string>
     <string name="ball_adjust_close_cd">关闭</string>
 
     <!-- Onboarding -->
@@ -79,7 +76,6 @@
     <string name="pin_action_passthrough">穿透</string>
     <string name="pin_action_lock">锁定</string>
     <string name="pin_action_minimize">收起</string>
-    <string name="pin_action_close">关闭</string>
     <string name="pin_action_save_toast">已保存到相册</string>
     <string name="pin_action_close_cd">关闭钉图</string>
 </resources>

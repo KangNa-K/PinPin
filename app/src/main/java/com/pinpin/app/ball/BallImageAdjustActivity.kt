@@ -19,7 +19,17 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.graphics.withSave
+import androidx.core.graphics.toColorInt
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.content.IntentCompat
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.pinpin.app.R
 import kotlin.math.max
 import kotlin.math.min
@@ -54,7 +64,13 @@ import kotlin.math.min
 class BallImageAdjustActivity : ComponentActivity() {
 
     private lateinit var preview: CircularImagePreview
-    private lateinit var sourceBitmap: Bitmap
+    private var sourceBitmap: Bitmap? = null
+    private val darkMode: Boolean
+        get() = resources.configuration.uiMode and
+            android.content.res.Configuration.UI_MODE_NIGHT_MASK ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+    private val surfaceColor: Int get() = if (darkMode) Color.rgb(28, 28, 30) else Color.WHITE
+    private val textColor: Int get() = if (darkMode) Color.WHITE else Color.rgb(31, 31, 35)
     /**
      * Snapshot of the latest transform from the preview.
      * The preview converts its preview-pixels into
@@ -70,13 +86,15 @@ class BallImageAdjustActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val uri: Uri = intent?.getParcelableExtra(EXTRA_SOURCE_URI)
+        enableEdgeToEdge()
+        val uri: Uri = IntentCompat.getParcelableExtra(intent, EXTRA_SOURCE_URI, Uri::class.java)
             ?: run { finish(); return }
-        sourceBitmap = decodeBitmap(uri) ?: run {
-            Log.w(TAG, "decode failed for $uri")
-            finish()
-            return
-        }
+        userScale = (savedInstanceState?.getFloat(EXTRA_RESULT_SCALE)
+            ?: intent.getFloatExtra(EXTRA_RESULT_SCALE, 1f)).let { if (it.isFinite()) it.coerceIn(0.5f, 5f) else 1f }
+        userOffsetX = (savedInstanceState?.getFloat(EXTRA_RESULT_OFFSET_X)
+            ?: intent.getFloatExtra(EXTRA_RESULT_OFFSET_X, 0f)).let { if (it.isFinite()) it else 0f }
+        userOffsetY = (savedInstanceState?.getFloat(EXTRA_RESULT_OFFSET_Y)
+            ?: intent.getFloatExtra(EXTRA_RESULT_OFFSET_Y, 0f)).let { if (it.isFinite()) it else 0f }
         // Root: a FrameLayout. We layer four bands explicitly:
         //   1. Top:    a white title bar with "调整悬浮球图片" and an X close
         //   2. Center: the BIG 280dp preview view (the ball itself is
@@ -91,7 +109,7 @@ class BallImageAdjustActivity : ComponentActivity() {
         // gravity per layer gives each band a clean, predictable
         // spot on the screen.
         val root = FrameLayout(this).apply {
-            setBackgroundColor(Color.parseColor("#F2F2F7"))
+            setBackgroundColor(if (darkMode) Color.BLACK else "#F2F2F7".toColorInt())
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -104,7 +122,7 @@ class BallImageAdjustActivity : ComponentActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = android.view.Gravity.CENTER_VERTICAL
             setPadding(dp(16), dp(0), dp(8), dp(0))
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(surfaceColor)
             elevation = dp(2).toFloat()
         }
         titleBar.addView(
@@ -118,16 +136,16 @@ class BallImageAdjustActivity : ComponentActivity() {
                     TextView(this@BallImageAdjustActivity).apply {
                         text = getString(R.string.ball_adjust_title)
                         textSize = 17f
-                        setTextColor(Color.parseColor("#1F1F23"))
+                        setTextColor(textColor)
                         setTypeface(typeface, android.graphics.Typeface.BOLD)
                     },
                 )
                 // Tiny hint that the preview circle is enlarged
                 // for visibility; the actual ball is 48dp.
                 TextView(this@BallImageAdjustActivity).apply {
-                    text = "（实际 48dp）"
+                    text = getString(R.string.ball_adjust_actual_size)
                     textSize = 11f
-                    setTextColor(Color.parseColor("#8E8E93"))
+                    setTextColor("#8E8E93".toColorInt())
                     setPadding(dp(6), 0, 0, 0)
                 }
             },
@@ -138,7 +156,7 @@ class BallImageAdjustActivity : ComponentActivity() {
             TextView(this).apply {
                 text = "×"
                 textSize = 24f
-                setTextColor(Color.parseColor("#8E8E93"))
+                setTextColor("#8E8E93".toColorInt())
                 contentDescription = getString(R.string.ball_adjust_close_cd)
                 gravity = android.view.Gravity.CENTER
                 layoutParams = LinearLayout.LayoutParams(dp(48), LinearLayout.LayoutParams.MATCH_PARENT)
@@ -184,6 +202,8 @@ class BallImageAdjustActivity : ComponentActivity() {
             userOffsetY = y / preview.displayMultiplier
         }
         root.addView(preview)
+        preview.restoreTransform(userScale, userOffsetX * preview.displayMultiplier,
+            userOffsetY * preview.displayMultiplier)
 
 
         // 3) Bottom confirm row — 3 buttons, each weight=1, 48dp
@@ -193,7 +213,7 @@ class BallImageAdjustActivity : ComponentActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = android.view.Gravity.CENTER
             setPadding(dp(16), dp(12), dp(16), dp(20))
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(surfaceColor)
         }
         confirmRow.addView(makeTextButton(getString(R.string.ball_adjust_cancel)) {
             setResult(RESULT_CANCELED)
@@ -202,7 +222,8 @@ class BallImageAdjustActivity : ComponentActivity() {
         confirmRow.addView(makeTextButton(getString(R.string.ball_adjust_reset)) {
             preview.resetTransform()
         })
-        confirmRow.addView(makeTextButton(getString(R.string.ball_adjust_save)) {
+        val saveButton = makeTextButton(getString(R.string.ball_adjust_save)) {
+            if (sourceBitmap == null) return@makeTextButton
             val data = Intent().apply {
                 putExtra(EXTRA_RESULT_URI, uri)
                 putExtra(EXTRA_RESULT_SCALE, userScale)
@@ -211,7 +232,8 @@ class BallImageAdjustActivity : ComponentActivity() {
             }
             setResult(RESULT_OK, data)
             finish()
-        })
+        }.apply { isEnabled = false; alpha = 0.5f }
+        confirmRow.addView(saveButton)
         root.addView(
             confirmRow,
             FrameLayout.LayoutParams(
@@ -220,7 +242,50 @@ class BallImageAdjustActivity : ComponentActivity() {
             ).apply { gravity = android.view.Gravity.BOTTOM },
         )
 
+        ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
+            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(
+                systemBars.left,
+                systemBars.top,
+                systemBars.right,
+                systemBars.bottom,
+            )
+            insets
+        }
+        ViewCompat.requestApplyInsets(root)
         setContentView(root)
+        lifecycleScope.launch {
+            var decoded: Bitmap? = null
+            try {
+                withContext(Dispatchers.IO) {
+                    decoded = try {
+                        decodeBitmap(uri)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Image decode failed", e)
+                        null
+                    } catch (e: OutOfMemoryError) {
+                        Log.w(TAG, "Image too large", e)
+                        null
+                    }
+                }
+                val image = decoded
+                if (image == null) {
+                    android.widget.Toast.makeText(this@BallImageAdjustActivity,
+                        "无法读取图片，请重新选择", android.widget.Toast.LENGTH_LONG).show()
+                    setResult(RESULT_CANCELED)
+                    finish()
+                } else {
+                    sourceBitmap = image
+                    decoded = null
+                    preview.source = image
+                    preview.invalidate()
+                    saveButton.isEnabled = true
+                    saveButton.alpha = 1f
+                }
+            } finally {
+                decoded?.recycle()
+            }
+        }
     }
 
     private fun decodeBitmap(uri: Uri): Bitmap? {
@@ -230,11 +295,10 @@ class BallImageAdjustActivity : ComponentActivity() {
             BitmapFactory.decodeStream(stream, null, bounds)
         }
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-        // Cap the long-edge at 2048px — more than enough for the
-        // ~76dp ball, while keeping the in-memory bitmap small
-        // (~16 MB ARGB_8888 at the cap).
+        // Power-of-two sampling bounds the preview to a 1024px long edge.
         val longEdge = max(bounds.outWidth, bounds.outHeight)
-        val sample = if (longEdge > 2048) longEdge / 2048 else 1
+        var sample = 1
+        while (longEdge / sample > 1024) sample *= 2
         val opts = BitmapFactory.Options().apply {
             inSampleSize = sample
             inPreferredConfig = Bitmap.Config.ARGB_8888
@@ -258,7 +322,7 @@ class BallImageAdjustActivity : ComponentActivity() {
             textSize = 24f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             gravity = android.view.Gravity.CENTER
-            setTextColor(Color.parseColor("#1F1F23"))
+            setTextColor("#1F1F23".toColorInt())
             background = android.graphics.drawable.GradientDrawable().apply {
                 shape = android.graphics.drawable.GradientDrawable.OVAL
                 setColor(Color.WHITE)
@@ -287,7 +351,7 @@ class BallImageAdjustActivity : ComponentActivity() {
             textSize = 22f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             gravity = android.view.Gravity.CENTER
-            setTextColor(Color.parseColor("#1F1F23"))
+            setTextColor("#1F1F23".toColorInt())
             contentDescription = getString(contentDescriptionRes)
             background = android.graphics.drawable.GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
@@ -326,7 +390,7 @@ class BallImageAdjustActivity : ComponentActivity() {
             background = android.graphics.drawable.GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = dp(10).toFloat()
-                setColor(Color.parseColor("#007AFF"))
+                setColor("#007AFF".toColorInt())
             }
             layoutParams = LinearLayout.LayoutParams(
                 0,
@@ -344,8 +408,17 @@ class BallImageAdjustActivity : ComponentActivity() {
 
 
     override fun onDestroy() {
-        if (::sourceBitmap.isInitialized) sourceBitmap.recycle()
+        if (::preview.isInitialized) preview.source = null
+        sourceBitmap?.recycle()
+        sourceBitmap = null
         super.onDestroy()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putFloat(EXTRA_RESULT_SCALE, userScale)
+        outState.putFloat(EXTRA_RESULT_OFFSET_X, userOffsetX)
+        outState.putFloat(EXTRA_RESULT_OFFSET_Y, userOffsetY)
+        super.onSaveInstanceState(outState)
     }
 
     companion object {
@@ -421,7 +494,7 @@ private val basePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     }
     private val placeholderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.parseColor("#E0E0E5")
+        color = "#E0E0E5".toColorInt()
     }
     private val matrix = Matrix()
     private val clipPath = android.graphics.Path()
@@ -459,6 +532,13 @@ private val basePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
         pushTransform()
     }
 
+    fun restoreTransform(scale: Float, x: Float, y: Float) {
+        userScale = scale
+        userOffsetX = x
+        userOffsetY = y
+        pushTransform()
+    }
+
     private fun pushTransform() {
         onTransformChanged?.invoke(userScale, userOffsetX, userOffsetY)
         invalidate()
@@ -467,6 +547,13 @@ private val basePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
         scaleDetector.onTouchEvent(event)
+        if (event.actionMasked == MotionEvent.ACTION_POINTER_UP && event.pointerCount == 2) {
+            val remaining = if (event.actionIndex == 0) 1 else 0
+            lastTouchX = event.getX(remaining)
+            lastTouchY = event.getY(remaining)
+            isDragging = true
+            return true
+        }
         // Use only single-pointer events for drag; once two
         // fingers land the scale detector owns the gesture.
         if (event.pointerCount == 1) {
@@ -553,14 +640,14 @@ private val basePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
         // BallView renders (BallView draws the bitmap AS the
         // fill of a circle, so anything outside the circle is
         // not drawn). Without this clip the preview lies.
-        canvas.save()
-        // Position the pre-built clipPath at the current center
-        // and apply it to the canvas.
-        clipPath.reset()
-        clipPath.addCircle(cx, cy, r, android.graphics.Path.Direction.CW)
-        canvas.clipPath(clipPath)
-        canvas.drawBitmap(bmp, matrix, basePaint)
-        canvas.restore()
+        canvas.withSave {
+            // Position the pre-built clipPath at the current center
+            // and apply it to the canvas.
+            clipPath.reset()
+            clipPath.addCircle(cx, cy, r, android.graphics.Path.Direction.CW)
+            clipPath(clipPath)
+            drawBitmap(bmp, this@CircularImagePreview.matrix, basePaint)
+        }
 
         // Re-draw the white ring on top so it stays crisp
         // regardless of the bitmap's coverage, exactly as

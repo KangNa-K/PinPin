@@ -1,24 +1,61 @@
+import java.util.Properties
+import java.io.File
+
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.compose.compiler)
     alias(libs.plugins.ksp)
     alias(libs.plugins.hilt)
 }
 
 android {
     namespace = "com.pinpin.app"
-    compileSdk = 34
+    compileSdk = 37
+    buildFeatures {
+        buildConfig = true
+    }
 
     defaultConfig {
         applicationId = "com.pinpin.app"
         minSdk = 30
-        targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        targetSdk = 37
+        versionCode = 7
+        versionName = "1.0.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
+        }
+    }
+
+    val releaseKeystoreDir = providers.gradleProperty("pinpin.keystoreDir").orNull
+        ?.let(::File)
+        ?: System.getenv("PINPIN_KEYSTORE_DIR")?.let(::File)
+        ?: File(System.getProperty("user.home"), ".android-keys/pockref")
+    val releaseKeystoreProperties = File(releaseKeystoreDir, "keystore.properties")
+    val hasReleaseSigning = releaseKeystoreProperties.isFile
+
+    signingConfigs {
+        create("release") {
+            // The signing directory is supplied by the pinpin.keystoreDir
+            // Gradle property or PINPIN_KEYSTORE_DIR environment variable.
+            // The historical ~/.android-keys/pockref fallback is retained for
+            // the existing local setup, but signing is optional for CI.
+            if (hasReleaseSigning) {
+                val keystoreProps = Properties()
+                releaseKeystoreProperties.inputStream().use { keystoreProps.load(it) }
+                val storeFileName = keystoreProps.getProperty("storeFile")
+                    ?: error("keystore.properties is missing storeFile")
+                storeFile = File(storeFileName).let { file ->
+                    if (file.isAbsolute) file else File(releaseKeystoreDir, storeFileName)
+                }
+                storePassword = keystoreProps.getProperty("storePassword")
+                    ?: error("keystore.properties is missing storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                    ?: error("keystore.properties is missing keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+                    ?: error("keystore.properties is missing keyPassword")
+            }
         }
     }
 
@@ -34,6 +71,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 
@@ -42,16 +82,8 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
-    buildFeatures {
-        compose = true
-    }
-
-    composeOptions {
-        kotlinCompilerExtensionVersion = libs.versions.compose.compiler.get()
+    ksp {
+        arg("room.schemaLocation", "$projectDir/schemas")
     }
 
     packaging {
@@ -80,7 +112,7 @@ dependencies {
     implementation(libs.compose.ui.tooling.preview)
     implementation(libs.compose.foundation)
     implementation(libs.compose.material3)
-    implementation(libs.compose.material.icons.extended)
+    implementation(libs.compose.material.icons.core)
     debugImplementation(libs.compose.ui.tooling)
     debugImplementation(libs.compose.ui.test.manifest)
 
@@ -102,6 +134,7 @@ dependencies {
 
     // Test
     testImplementation(libs.junit)
+    testImplementation("org.json:json:20231013")
     testImplementation(libs.androidx.test.core)
     testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(libs.androidx.test.ext.junit)

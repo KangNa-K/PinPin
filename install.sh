@@ -17,6 +17,13 @@
 
 set -e
 
+# Prefer an explicit JDK 17. On macOS, fall back to Android Studio's
+# bundled runtime when the shell does not have a working JAVA_HOME.
+if ! java -version >/dev/null 2>&1 && [ -d "/Applications/Android Studio.app/Contents/jbr/Contents/Home" ]; then
+  export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+  export PATH="$JAVA_HOME/bin:$PATH"
+fi
+
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 export JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8 -Dsun.jnu.encoding=UTF-8"

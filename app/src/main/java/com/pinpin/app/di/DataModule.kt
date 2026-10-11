@@ -3,6 +3,7 @@ package com.pinpin.app.di
 import android.content.Context
 import androidx.room.Room
 import com.pinpin.app.data.PinDatabase
+import com.pinpin.app.data.PinDatabaseMigrations
 import com.pinpin.app.data.PinDao
 import com.pinpin.app.data.ScreenshotHistoryDao
 import dagger.Module
@@ -28,10 +29,12 @@ object DataModule {
             PinDatabase::class.java,
             PinDatabase.DATABASE_NAME,
         )
-            // No destructive migration: pin data is not high-stakes, but
-            // losing it on a schema bump is annoying. Future versions will
-            // add proper migrations.
-            .fallbackToDestructiveMigration()
+            .addMigrations(
+                PinDatabaseMigrations.MIGRATION_1_2,
+                PinDatabaseMigrations.MIGRATION_2_3,
+                PinDatabaseMigrations.MIGRATION_3_4,
+                PinDatabaseMigrations.MIGRATION_4_5,
+            )
             .build()
 
     @Provides

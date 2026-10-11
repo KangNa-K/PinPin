@@ -10,13 +10,10 @@ import androidx.room.RoomDatabase
     //  v2 — screenshot_history
     //  v3 — pins.{rotation, flipped} added
     //  v4 — pins.annotatedImageUri added (post-annotation cache URI)
-    // Bumping to v4 because [PinEntity] grew a nullable
-    // [PinEntity.annotatedImageUri] column. With
-    // [fallbackToDestructiveMigration] the existing v3 db is dropped
-    // and recreated; pin data is lost, which is acceptable for now
-    // (matches the policy set in [com.pinpin.app.di.DataModule]).
-    version = 4,
-    exportSchema = false,
+    // v4 adds [PinEntity.annotatedImageUri]; v5 persists serial badge
+    // visibility. Every transition is covered by [PinDatabaseMigrations].
+    version = 5,
+    exportSchema = true,
 )
 abstract class PinDatabase : RoomDatabase() {
     abstract fun pinDao(): PinDao
