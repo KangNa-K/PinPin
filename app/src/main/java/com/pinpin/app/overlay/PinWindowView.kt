@@ -264,12 +264,15 @@ class PinWindowView(
 
     private fun toolbarRows(@Suppress("UNUSED_PARAMETER") width: Int): Int = 1
 
-    private fun arrangeToolbar(@Suppress("UNUSED_PARAMETER") width: Int) {
+    private fun arrangeToolbar(width: Int) {
         // The image toolbar is intentionally a single horizontal row.
         // Its viewport can scroll horizontally, but the row itself is
         // never split into multiple lines.
         val columns = 7
         toolbarViewport.layoutParams = toolbarViewport.layoutParams.apply {
+            this.width = minOf(width, toolbarWidth())
+        }
+        toolbar.layoutParams = toolbar.layoutParams.apply {
             this.width = toolbarWidth()
         }
         if (columns == toolbarColumns) return
@@ -352,11 +355,10 @@ class PinWindowView(
         val initialImageH = spec.heightPx
         // Controls scroll within the image width rather than expanding
         // the overlay's input window into the surrounding app.
-        val wrapperW = maxOf(initialImageW, toolbarWidth())
         val wrapperH = initialImageH
 
         layoutParams = WindowManager.LayoutParams(
-            wrapperW,
+            initialImageW,
             wrapperH,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
@@ -383,12 +385,8 @@ class PinWindowView(
         // the toolbar sibling below can render its own rounded pill
         // without inheriting the imageCard's outline.
         cornerRadiusPx = dpToPx(CORNER_RADIUS_DP).toFloat()
-        // imageCard is centered horizontally inside the wrapper. If
-        // the wrapper is wider than the image (because the toolbar's
-        // minimum width forced a larger wrapper), the extra space is
-        // split equally on both sides so the toolbar — which is
-        // itself centered in the wrapper — stays aligned with the
-        // image's horizontal center.
+        // In normal mode the wrapper matches the image width. Centering
+        // also keeps the image aligned when annotation mode widens it.
         val imageCardLp = LayoutParams(initialImageW, initialImageH).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
         }
@@ -552,11 +550,14 @@ class PinWindowView(
         }
         toolbarViewport = HorizontalScrollView(context).apply {
             isHorizontalScrollBarEnabled = false
+            background = toolbar.background
+            toolbar.background = null
+            clipToOutline = true
             visibility = View.INVISIBLE
             alpha = 0f
             translationY = dpToPx(TOOLBAR_ANIM_TRANSLATE_DP).toFloat()
             addView(toolbar, LayoutParams(
-                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT,
+                toolbarWidth(), LayoutParams.WRAP_CONTENT,
             ))
         }
         addView(
@@ -1190,7 +1191,7 @@ class PinWindowView(
         }
 
         // Toolbar pill
-        (toolbar.background as? android.graphics.drawable.GradientDrawable)?.apply {
+        (toolbarViewport.background as? android.graphics.drawable.GradientDrawable)?.apply {
             setColor(theme.surfaceFill)
             setStroke(dpToPx(1), theme.surfaceStroke)
         }
@@ -2060,6 +2061,19 @@ class PinWindowView(
     // ----------------------------------------------------------------
     // Touch handling
     // ----------------------------------------------------------------
+    private fun isImageGestureTarget(x: Float, y: Float): Boolean {
+        if (x < imageCard.left || x >= imageCard.right ||
+            y < imageCard.top || y >= imageCard.bottom
+        ) return false
+        val imageX = x - imageCard.left
+        val imageY = y - imageCard.top
+        return (imageActionButtons + closeButton).none {
+            it.visibility == View.VISIBLE && it.isEnabled &&
+                imageX >= it.left && imageX < it.right &&
+                imageY >= it.top && imageY < it.bottom
+        }
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
         // In annotation mode, the drawing overlay handles all touches
@@ -2122,10 +2136,12 @@ class PinWindowView(
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                // Empty wrapper space is not an image drag or selection target.
-                if (event.x < imageCard.left || event.x >= imageCard.right ||
-                    event.y < imageCard.top || event.y >= imageCard.bottom
-                ) return false
+                interacting = false
+                cornerDragIndex = NO_CORNER_DRAG
+                dragged = false
+                // A gesture belongs to the image only when its DOWN hits
+                // the image body, never wrapper padding or action controls.
+                if (!isImageGestureTarget(event.x, event.y)) return false
                 interacting = true
                 downLayoutX = currentX
                 downLayoutY = currentY
@@ -2171,6 +2187,7 @@ class PinWindowView(
                 }
             }
             MotionEvent.ACTION_MOVE -> {
+                if (!interacting) return false
                 if (cornerDragIndex >= 0) {
                     if (!cornerMoved && hypot(
                             event.rawX - cornerDragDownFingerX,
@@ -2207,6 +2224,7 @@ class PinWindowView(
                 }
             }
             MotionEvent.ACTION_CANCEL -> {
+                if (!interacting) return false
                 cornerDragIndex = NO_CORNER_DRAG
                 interacting = false
                 dragged = false
@@ -2233,6 +2251,7 @@ class PinWindowView(
                 invalidate()
             }
             MotionEvent.ACTION_UP -> {
+                if (!interacting) return false
                 val changed = currentX != downLayoutX || currentY != downLayoutY ||
                     currentW != gestureStartW || currentH != gestureStartH
                 if (cornerDragIndex >= 0) {
@@ -2462,7 +2481,7 @@ class PinWindowView(
         // (the user might still want to see it / tap it).
         val toolbarOverhead = dpToPx(TOOLBAR_GAP_DP) + toolbarRows(w) * dpToPx(TOOLBAR_HEIGHT_DP)
         val wrapperH = h + toolbarOverhead
-        val wrapperW = maxOf(w, toolbarWidth())
+        val wrapperW = w
         val maxX = bounds.right - wrapperW / 4
         val minX = -wrapperW + wrapperW / 4
         val maxY = bounds.bottom - wrapperH / 4
@@ -2530,7 +2549,9 @@ class PinWindowView(
         arrangeToolbar(w)
         val toolbarHeight = toolbarRows(w) * dpToPx(TOOLBAR_HEIGHT_DP)
         val toolbarOverhead = dpToPx(TOOLBAR_GAP_DP) + toolbarHeight
-        lp.width = maxOf(w, toolbarWidth())
+        // Keep the input window aligned to the image. The toolbar viewport
+        // scrolls inside this width when the image is narrower than its content.
+        lp.width = w
         lp.height = h + if (toolbarShown) toolbarOverhead else 0
         runCatching { windowManager.updateViewLayout(this, lp) }
         // Sync the imageCard dimensions so the image scales rather
