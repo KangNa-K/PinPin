@@ -74,6 +74,7 @@ class BallService : Service() {
     private var savingCapture: String? = null
     private var hiddenForCapture: String? = null
     private var previousBallVisibility = android.view.View.VISIBLE
+    private var previousBallAlpha = 1f
     private var captureStartedAt = 0L
     private var captureToast: android.widget.Toast? = null
     private val slowCaptureFeedback = Runnable {
@@ -99,6 +100,11 @@ class BallService : Service() {
         }
     }
 
+    private var carryController: BallCarryController? = null
+    private var captureBounds: Rect? = null
+    private var autoOrigin: Pair<Int, Int>? = null
+    private var manualCarry = false
+    private var suppressCaptureCancel = false
     private var ballAttached = false
     private var overlayView: SelectionOverlayView? = null
     private var overlayAttached = false
@@ -115,7 +121,11 @@ class BallService : Service() {
                     if (hiddenForCapture == null) {
                         hiddenForCapture = id
                         previousBallVisibility = ballView.visibility
-                        ballView.visibility = android.view.View.INVISIBLE
+                        previousBallAlpha = ballView.alpha
+                        // Visibility changes cancel the original touch target. Alpha hides
+                        // screenshot pixels while keeping the held pointer eligible for drag.
+                        if (pendingAction == Protocol.ACTION_AUTO_CARRY) ballView.alpha = 0f
+                        else ballView.visibility = android.view.View.INVISIBLE
                     }
                     try {
                         check(detachOverlay()) { "Selection window did not detach" }
@@ -148,6 +158,8 @@ class BallService : Service() {
                 }
                 Protocol.RESULT -> {
                     if (!intent.hasExtra(Protocol.SUCCESS)) return
+                    captureBounds = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(Protocol.BOUNDS, Rect::class.java)
+                        else { @Suppress("DEPRECATION") intent.getParcelableExtra(Protocol.BOUNDS) }
                     completeCapture(id, intent.getBooleanExtra(Protocol.SUCCESS, false),
                         intent.getStringExtra(Protocol.ERROR),
                         intent.getStringExtra(Protocol.HISTORY_PATH))
@@ -212,6 +224,8 @@ class BallService : Service() {
             if (hiddenForCapture == id) runCatching { PinOverlayService.setAllPinsVisible(this, true) }
             restoreCaptureBall(id)
         }
+        carryController?.close()
+        carryController = null
         captureHandler.removeCallbacksAndMessages(null)
         captureToast?.cancel()
         detachOverlay()
@@ -283,11 +297,13 @@ class BallService : Service() {
         // finger lifts without ever arming.
         ballView.onTap = {
             Log.d(TAG, "ball tapped — launching host app")
-            openHostApp()
+            if (carryController?.hasImage == true) carryController?.showActions() else openHostApp()
         }
         runCatching { windowManager.addView(ballView, lp) }
             .onSuccess {
                 ballAttached = true
+                carryController = BallCarryController(this, ballView, windowManager,
+                    { showCaptureMessage(it, true) }, { openHostApp() })
                 // Restore the user's last-chosen image (if any) so the
                 // ball is in the right visual state the moment it
                 // appears. We do this after addView so the view has
@@ -377,7 +393,7 @@ class BallService : Service() {
         }
     }
 
-    private fun attachOverlay(originX: Int, originY: Int): Boolean {
+    private fun attachOverlay(originX: Int, originY: Int, autoCaptureEnabled: Boolean): Boolean {
         if (overlayAttached) return true
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
@@ -389,6 +405,7 @@ class BallService : Service() {
         val view = SelectionOverlayView(overlayContext).apply {
             listener = overlayListener
             precisionEnabled = true
+            this.autoCaptureEnabled = autoCaptureEnabled
         }
         val type = if (accessibilityService != null) WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
             else WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -430,13 +447,13 @@ class BallService : Service() {
 
     private val ballHost: BallView.Host = object : BallView.Host {
         override fun onArm(originX: Int, originY: Int) {
-            if (pendingCapture != null) {
+            if (pendingCapture != null || carryController?.isBusy == true) {
                 ballView.resetToIdle()
                 return
             }
             Log.d(TAG, "ball.onArm at ($originX, $originY) — bringing up selection overlay")
             // Keep the original input target alive; the overlay renders the cursor.
-            if (!attachOverlay(originX, originY)) {
+            if (!attachOverlay(originX, originY, autoCaptureEnabled = true)) {
                 ballView.resetToIdle()
                 return
             }
@@ -451,10 +468,13 @@ class BallService : Service() {
             detachOverlay()
             ballView.resetToIdle()
             // Only send the request here; screenshot processing remains off-thread.
-            runCapture(rectInScreen)
+            runCapture(rectInScreen, if (manualCarry) Protocol.ACTION_CARRY else Protocol.ACTION_PIN)
+            manualCarry = false
         }
 
         override fun onCancel() {
+            if (suppressCaptureCancel || pendingCapture != null) return
+            manualCarry = false
             Log.d(TAG, "ball.onCancel")
             detachOverlay()
             ballView.resetToIdle()
@@ -465,6 +485,17 @@ class BallService : Service() {
         override fun onConfirm(rect: Rect) {
             ballHost.onSelectDone(rect)
         }
+        override fun onAutoCapture(x: Int, y: Int) {
+            autoOrigin = x to y
+            // If this is a retry from the manual fallback, do not carry that mode
+            // into the next capture cycle.
+            manualCarry = false
+            suppressCaptureCancel = true
+            detachOverlay()
+            ballView.beginCarryCaptureGesture()
+            suppressCaptureCancel = false
+            runCapture(Rect(0, 0, ballView.attachedDisplayWidth, ballView.attachedDisplayHeight), Protocol.ACTION_AUTO_CARRY)
+        }
         override fun onAction(rect: Rect, action: SelectionOverlayView.Action) {
             val captureAction = when (action) {
                 SelectionOverlayView.Action.ANNOTATE -> Protocol.ACTION_ANNOTATE
@@ -472,6 +503,7 @@ class BallService : Service() {
                 SelectionOverlayView.Action.COPY -> Protocol.ACTION_COPY
                 SelectionOverlayView.Action.SHARE -> Protocol.ACTION_SHARE
                 SelectionOverlayView.Action.SAVE -> Protocol.ACTION_SAVE
+                SelectionOverlayView.Action.CARRY -> Protocol.ACTION_CARRY
             }
             // The action toolbar can finish the selection directly, so it
             // does not pass through onSelectDone(). Restore the ball and
@@ -481,7 +513,8 @@ class BallService : Service() {
             // apparently missing after a pin action.
             detachOverlay()
             ballView.resetToIdle()
-            runCapture(rect, captureAction)
+            runCapture(rect, if (manualCarry && captureAction == Protocol.ACTION_PIN) Protocol.ACTION_CARRY else captureAction)
+            manualCarry = false
         }
         override fun onCancel() {
             ballHost.onCancel()
@@ -516,6 +549,10 @@ class BallService : Service() {
                 setPackage(packageName)
                 putExtra(Protocol.ID, requestId)
                 putExtra(Protocol.ACTION, action)
+                if (action == Protocol.ACTION_AUTO_CARRY) {
+                    putExtra(Protocol.SEED_X, autoOrigin?.first ?: -1)
+                    putExtra(Protocol.SEED_Y, autoOrigin?.second ?: -1)
+                }
                 putExtra(PinAccessibilityService.EXTRA_RECT_LEFT, rect.left)
                 putExtra(PinAccessibilityService.EXTRA_RECT_TOP, rect.top)
                 putExtra(PinAccessibilityService.EXTRA_RECT_RIGHT, rect.right)
@@ -530,7 +567,10 @@ class BallService : Service() {
     private fun restoreCaptureBall(id: String) {
         if (hiddenForCapture != id) return
         hiddenForCapture = null
-        if (ballAttached) ballView.visibility = previousBallVisibility
+        if (ballAttached) {
+            ballView.visibility = previousBallVisibility
+            ballView.alpha = previousBallAlpha
+        }
     }
 
     private fun completeCapture(id: String, success: Boolean, error: String?, historyPath: String? = null) {
@@ -545,6 +585,20 @@ class BallService : Service() {
         savingCapture = null
         if (com.pinpin.app.BuildConfig.DEBUG) Log.d("CaptureTiming",
             "id=$id ball_receipt=${SystemClock.elapsedRealtime() - captureStartedAt}ms success=$success")
+        if (!success && action == Protocol.ACTION_AUTO_CARRY) ballView.finishCaptureGesture()
+        if (!success && action == Protocol.ACTION_AUTO_CARRY) ballView.alpha = 1f
+        if (!success && error == "region_not_found") {
+            val origin = autoOrigin
+            if (origin != null) {
+                manualCarry = true
+                if (attachOverlay(origin.first, origin.second, autoCaptureEnabled = false)) {
+                    ballView.resetToIdle()
+                    showCaptureMessage("未能可靠识别图片边界，请拖出范围，再点“吸入悬浮球”", true)
+                    return
+                }
+                manualCarry = false
+            }
+        }
         if (!success) {
             Log.w(TAG, "Capture $id failed: $error")
             val message = when (error) {
@@ -570,6 +624,7 @@ class BallService : Service() {
         val file = runCatching { java.io.File(rawPath).canonicalFile }.getOrNull()
             ?.takeIf { it.parentFile == historyRoot && it.isFile } ?: return
         when (action) {
+            Protocol.ACTION_CARRY, Protocol.ACTION_AUTO_CARRY -> carryController?.accept(file, captureBounds)
             Protocol.ACTION_COPY -> {
                 val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
                 val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager

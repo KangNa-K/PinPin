@@ -63,7 +63,7 @@
 
     <!-- Accessibility service metadata -->
     <string name="a11y_service_label">钉图 · 屏幕截图服务</string>
-    <string name="a11y_service_description">用于在用户拖动悬浮球框选时抓取屏幕像素。无障碍权限只用于这一项功能,不会读取任何输入或模拟点击。</string>
+    <string name="a11y_service_description">用于在用户操作悬浮球时截取屏幕，并在自动吸图时读取图片控件的位置以准确裁图。不保存页面文字，不读取输入内容或模拟点击。</string>
 
     <!-- Pin toolbar actions (shown when the user taps a pinned image) -->
     <string name="pin_action_rotate">旋转</string>

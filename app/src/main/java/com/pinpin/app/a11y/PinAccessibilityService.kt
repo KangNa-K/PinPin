@@ -54,6 +54,10 @@ class PinAccessibilityService : AccessibilityService() {
         var capture: Runnable? = null
         var action: String = Protocol.ACTION_PIN
         var historyPath: String? = null
+        var seedX = -1
+        var seedY = -1
+        var capturedBounds: Rect? = null
+        var imageNodeBounds: Rect? = null
     }
 
     private val captureReceiver = object : BroadcastReceiver() {
@@ -78,11 +82,13 @@ class PinAccessibilityService : AccessibilityService() {
                         reply(id, "busy")
                     } else {
                         begin(Request(id, rect).also {
+                            it.seedX = intent.getIntExtra(Protocol.SEED_X, -1)
+                            it.seedY = intent.getIntExtra(Protocol.SEED_Y, -1)
                             it.action = intent.getStringExtra(Protocol.ACTION)
                                 ?.takeIf { action -> action in setOf(
                                     Protocol.ACTION_PIN, Protocol.ACTION_COPY,
                                     Protocol.ACTION_SHARE, Protocol.ACTION_SAVE,
-                                    Protocol.ACTION_ANNOTATE,
+                                    Protocol.ACTION_ANNOTATE, Protocol.ACTION_CARRY, Protocol.ACTION_AUTO_CARRY,
                                 ) } ?: Protocol.ACTION_PIN
                         })
                     }
@@ -115,6 +121,10 @@ class PinAccessibilityService : AccessibilityService() {
 
     private fun screenshot(r: Request) {
         try {
+            if (r.action == Protocol.ACTION_AUTO_CARRY) {
+                r.imageNodeBounds = imageBoundsAt(r.seedX, r.seedY)
+                Log.d(TAG, "Auto image node seed=(${r.seedX},${r.seedY}) bounds=${r.imageNodeBounds}")
+            }
             r.timings.mark("capture_start")
             takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
                 override fun onFailure(errorCode: Int) = abortCapture(r, "screenshot_$errorCode")
@@ -152,12 +162,24 @@ class PinAccessibilityService : AccessibilityService() {
                                                 hardware.recycle()
                                             }
                                             try {
-                                                val crop = requireNotNull(CaptureBounds(r.rect.left, r.rect.top,
-                                                    r.rect.right, r.rect.bottom).intersect(software.width, software.height)) {
+                                                val selected = if (r.action == Protocol.ACTION_AUTO_CARRY) {
+                                                    r.imageNodeBounds ?: detectRegion(software, r.seedX, r.seedY)?.also {
+                                                        Log.d(TAG, "Auto pixel detector bounds=$it screenshot=${software.width}x${software.height}")
+                                                    } ?: run {
+                                                        Log.w(TAG, "Auto image region not found seed=(${r.seedX},${r.seedY}) screenshot=${software.width}x${software.height}")
+                                                        throw IllegalStateException("region_not_found")
+                                                    }
+                                                } else r.rect
+                                                val crop = requireNotNull(CaptureBounds(selected.left, selected.top,
+                                                    selected.right, selected.bottom).intersect(software.width, software.height)) {
                                                     "Selection outside screenshot"
+                                                }
+                                                if (r.action == Protocol.ACTION_AUTO_CARRY) {
+                                                    Log.d(TAG, "Auto crop source=${if (r.imageNodeBounds != null) "widget" else "pixels"} bounds=$crop")
                                                 }
                                                 bitmap = Bitmap.createBitmap(software, crop.left, crop.top, crop.width, crop.height)
                                                 capturedBounds = crop
+                                                r.capturedBounds = Rect(crop.left, crop.top, crop.right, crop.bottom)
                                             } finally {
                                                 if (bitmap !== software) software.recycle()
                                             }
@@ -194,7 +216,7 @@ class PinAccessibilityService : AccessibilityService() {
                                 discard = { pinRepository.discardUnreferencedAsset(it) },
                                 receipt = { failure ->
                                     if (failure != null) Log.e(TAG, "Capture save failed", failure)
-                                    finish(r, if (failure == null) null else "saving_failed")
+                                    finish(r, if (failure == null) null else if (failure.message == "region_not_found") "region_not_found" else "saving_failed")
                                 },
                             )
                         } finally {
@@ -211,6 +233,64 @@ class PinAccessibilityService : AccessibilityService() {
             Log.e(TAG, "takeScreenshot failed synchronously", e)
             abortCapture(r, "screenshot_exception")
         }
+    }
+
+    private fun detectRegion(bitmap: Bitmap, x: Int, y: Int): Rect? {
+        if (x !in 0 until bitmap.width || y !in 0 until bitmap.height) return null
+        val scale = minOf(1f, 480f / maxOf(bitmap.width, bitmap.height))
+        val w = (bitmap.width * scale).toInt().coerceAtLeast(1)
+        val h = (bitmap.height * scale).toInt().coerceAtLeast(1)
+        val small = Bitmap.createScaledBitmap(bitmap, w, h, false)
+        return try {
+            val pixels = IntArray(w * h)
+            small.getPixels(pixels, 0, w, 0, 0, w, h)
+            com.pinpin.app.capture.ImageRegionDetector.detect(pixels, w, h,
+                (x.toLong() * w / bitmap.width).toInt(), (y.toLong() * h / bitmap.height).toInt())?.let {
+                Rect(it.left * bitmap.width / w, it.top * bitmap.height / h,
+                    it.right * bitmap.width / w, it.bottom * bitmap.height / h)
+            }
+        } finally { if (small !== bitmap) small.recycle() }
+    }
+
+    /** Query before restoring overlays; do not search a lower app through a foreground window. */
+    internal fun imageBoundsAt(x: Int, y: Int): Rect? = runCatching {
+        val window = windows.sortedByDescending { it.layer }.firstOrNull { window ->
+            window.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION &&
+                Rect().also(window::getBoundsInScreen).contains(x, y)
+        } ?: return@runCatching null
+        val root = window.root ?: return@runCatching null
+        val windowRect = Rect().also(window::getBoundsInScreen)
+        val images = mutableListOf<CaptureBounds>()
+        var remaining = 2048
+        fun visit(node: android.view.accessibility.AccessibilityNodeInfo, depth: Int) {
+            try {
+                if (--remaining < 0 || depth > 64) return
+                val bounds = Rect().also(node::getBoundsInScreen)
+                // Accessibility parent bounds are not guaranteed to enclose their children
+                // (notably in virtual/Compose trees), so use hit-testing only for candidates.
+                if (bounds.contains(x, y) && node.isVisibleToUser && node.className?.toString()?.let {
+                        it == "android.widget.ImageView" || it.endsWith(".AppCompatImageView")
+                    } == true) {
+                    images += CaptureBounds(bounds.left, bounds.top, bounds.right, bounds.bottom)
+                }
+                for (index in 0 until node.childCount) {
+                    if (remaining <= 0) break
+                    node.getChild(index)?.let { visit(it, depth + 1) }
+                }
+            } finally {
+                @Suppress("DEPRECATION")
+                node.recycle()
+            }
+        }
+        visit(root, 0)
+        com.pinpin.app.capture.ImageNodeBounds.select(images,
+            CaptureBounds(windowRect.left, windowRect.top, windowRect.right, windowRect.bottom),
+            x, y, (96 * resources.displayMetrics.density).toInt())?.let {
+            Rect(it.left, it.top, it.right, it.bottom)
+        }
+    }.getOrElse {
+        Log.w(TAG, "Image widget bounds unavailable; using pixel detection", it)
+        null
     }
 
     private fun reportSaving(r: Request) {
@@ -250,7 +330,7 @@ class PinAccessibilityService : AccessibilityService() {
         r.capture?.let(mainHandler::removeCallbacks)
         if (error != null && !r.saving) r.worker?.cancel()
         restoreWindows(r)
-        runCatching { reply(r.id, error, r.historyPath) }
+        runCatching { reply(r.id, error, r.historyPath, r.capturedBounds) }
             .onFailure { Log.e(TAG, "Capture receipt failed", it) }
         if (r.worker?.isCompleted != false) release(r)
     }
@@ -261,11 +341,11 @@ class PinAccessibilityService : AccessibilityService() {
         if (request === r) request = null
     }
 
-    private fun reply(id: String, error: String?, historyPath: String? = null) {
+    private fun reply(id: String, error: String?, historyPath: String? = null, bounds: Rect? = null) {
         sendBroadcast(Intent(Protocol.RESULT).setPackage(packageName)
             .putExtra(Protocol.ID, id).putExtra(Protocol.SUCCESS, error == null)
             .putExtra(Protocol.ERROR, error)
-            .putExtra(Protocol.HISTORY_PATH, historyPath))
+            .putExtra(Protocol.HISTORY_PATH, historyPath).putExtra(Protocol.BOUNDS, bounds))
     }
 
     override fun onServiceConnected() {

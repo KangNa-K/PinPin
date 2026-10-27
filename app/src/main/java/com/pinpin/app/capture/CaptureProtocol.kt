@@ -17,6 +17,11 @@ object CaptureProtocol {
     const val ACTION_SHARE = "share"
     const val ACTION_SAVE = "save"
     const val ACTION_ANNOTATE = "annotate"
+    const val ACTION_CARRY = "carry"
+    const val ACTION_AUTO_CARRY = "auto_carry"
+    const val SEED_X = "seed_x"
+    const val SEED_Y = "seed_y"
+    const val BOUNDS = "captured_bounds"
     const val TIMEOUT_MS = 15_000L
     fun validId(id: String?): Boolean =
         id != null && id.length in 1..64 && id.all { it.isLetterOrDigit() || it == '-' }

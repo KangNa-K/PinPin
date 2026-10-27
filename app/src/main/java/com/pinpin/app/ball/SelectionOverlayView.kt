@@ -69,6 +69,7 @@ class SelectionOverlayView @JvmOverloads constructor(
         fun onAction(rect: Rect, action: Action) = onConfirm(rect)
         /** Called on CANCEL (back press or second tap). */
         fun onCancel()
+        fun onAutoCapture(x: Int, y: Int) = Unit
     }
 
     enum class Action {
@@ -77,11 +78,25 @@ class SelectionOverlayView @JvmOverloads constructor(
         COPY,
         SHARE,
         SAVE,
+        CARRY,
     }
 
     var listener: Listener? = null
     /** Retained for existing callers; selection adjustment is now always inline. */
     var precisionEnabled: Boolean = false
+    var autoCaptureEnabled: Boolean = false
+    private var autoTouchX = 0f
+    private var autoTouchY = 0f
+    private val autoHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val autoCapture = Runnable {
+        if (armed && autoCaptureEnabled) {
+            armed = false
+            // Clear the carried stream offset before the overlay is removed.
+            touchOffsetX = 0f
+            touchOffsetY = 0f
+            listener?.onAutoCapture(originX.toInt(), originY.toInt())
+        }
+    }
     internal val isPrecisionAdjusting: Boolean get() = adjusting
     private var originX = 0f
     private var originY = 0f
@@ -213,6 +228,8 @@ class SelectionOverlayView @JvmOverloads constructor(
         adjustmentPanel.addView(actions)
         addView(adjustmentPanel, LayoutParams(-1, -2, Gravity.BOTTOM))
         val actionIcons = listOf(
+            Action.ANNOTATE to (com.pinpin.app.R.drawable.ic_action_annotate to "标注"),
+            Action.CARRY to (com.pinpin.app.R.drawable.ic_action_carry to "吸入悬浮球"),
             Action.PIN to (com.pinpin.app.R.drawable.ic_pin_push_pin to "钉图"),
             Action.COPY to (com.pinpin.app.R.drawable.ic_action_copy to "复制"),
             Action.SHARE to (com.pinpin.app.R.drawable.ic_action_share to "分享"),
@@ -414,6 +431,7 @@ class SelectionOverlayView @JvmOverloads constructor(
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
+                if (kotlin.math.hypot(event.rawX - autoTouchX, event.rawY - autoTouchY) > dp(12f)) autoHandler.removeCallbacks(autoCapture)
                 if (armed) {
                     if (adjusting) {
                         adjust(event.rawX, event.rawY)
@@ -427,6 +445,7 @@ class SelectionOverlayView @JvmOverloads constructor(
                 return true
             }
             MotionEvent.ACTION_UP -> {
+                autoHandler.removeCallbacks(autoCapture)
                 if (adjusting) {
                     adjust(event.rawX, event.rawY)
                     activeHandle = Handle.NONE
@@ -454,6 +473,7 @@ class SelectionOverlayView @JvmOverloads constructor(
                 return true
             }
             MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> {
+                autoHandler.removeCallbacks(autoCapture)
                 if (!armed && !adjusting) return true
                 if (adjusting) {
                     adjustmentStart?.let(::setRect)
@@ -489,6 +509,10 @@ class SelectionOverlayView @JvmOverloads constructor(
      * so the next ACTION_MOVE / ACTION_UP drives the rubber band.
      */
     fun forceArm(originX: Float, originY: Float, touchX: Float = originX, touchY: Float = originY) {
+        autoHandler.removeCallbacks(autoCapture)
+        autoTouchX = touchX
+        autoTouchY = touchY
+        if (autoCaptureEnabled) autoHandler.postDelayed(autoCapture, 450L)
         touchOffsetX = originX - touchX
         touchOffsetY = originY - touchY
         this.originX = clampX(originX)
@@ -506,6 +530,11 @@ class SelectionOverlayView @JvmOverloads constructor(
     private fun updateCursor(event: MotionEvent) {
         currentX = clampX(event.rawX + touchOffsetX)
         currentY = clampY(event.rawY + touchOffsetY)
+    }
+
+    override fun onDetachedFromWindow() {
+        autoHandler.removeCallbacks(autoCapture)
+        super.onDetachedFromWindow()
     }
 
     private fun rect(): Rect = Rect(
@@ -634,7 +663,7 @@ class SelectionOverlayView @JvmOverloads constructor(
         getLocationOnScreen(screenLocation)
         val toolbar = actionToolbar.layoutParams as LayoutParams
         val margin = dp(12f).toInt()
-        val toolbarWidth = dp(4 * 40f + 8f).toInt()
+        val toolbarWidth = dp(actionToolbar.childCount * 40f + 8f).toInt()
         val localLeft = selection.left - screenLocation[0]
         val localTop = selection.top - screenLocation[1]
         val localBottom = selection.bottom - screenLocation[1]

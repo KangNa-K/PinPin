@@ -97,6 +97,51 @@ class SelectionGestureTest {
         }
     }
 
+    @Test fun fallbackSelectionNeverRetriesAutomaticCaptureWhileFingerIsHeld() {
+        val captured = java.util.concurrent.atomic.AtomicInteger()
+        lateinit var view: SelectionOverlayView
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            view = overlay({})
+            view.autoCaptureEnabled = false
+            view.listener = object : SelectionOverlayView.Listener {
+                override fun onConfirm(rect: Rect) = Unit
+                override fun onCancel() = Unit
+                override fun onAutoCapture(x: Int, y: Int) { captured.incrementAndGet() }
+            }
+            view.forceArm(100f, 100f)
+            event(view, MotionEvent.ACTION_DOWN, 150f, 180f)
+        }
+        Thread.sleep(600)
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            assertEquals(0, captured.get())
+            event(view, MotionEvent.ACTION_MOVE, 300f, 360f)
+            event(view, MotionEvent.ACTION_UP, 300f, 360f)
+            assertEquals(View.VISIBLE, control(view, "钉图").visibility)
+        }
+    }
+
+    @Test fun fallbackSelectionRemainsManuallySelectable() {
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            var automaticCaptures = 0
+            var selected: Rect? = null
+            val view = overlay({ selected = it })
+            view.autoCaptureEnabled = false
+            view.listener = object : SelectionOverlayView.Listener {
+                override fun onConfirm(rect: Rect) { selected = rect }
+                override fun onCancel() = Unit
+                override fun onAutoCapture(x: Int, y: Int) { automaticCaptures++ }
+            }
+            view.forceArm(100f, 100f)
+            event(view, MotionEvent.ACTION_DOWN, 150f, 180f)
+            event(view, MotionEvent.ACTION_MOVE, 300f, 360f)
+            event(view, MotionEvent.ACTION_UP, 300f, 360f)
+            assertEquals(View.VISIBLE, control(view, "钉图").visibility)
+            control(view, "钉图").performClick()
+            assertEquals(Rect(100, 100, 300, 360), selected)
+            assertEquals(0, automaticCaptures)
+        }
+    }
+
     @Test fun precisionModeShowsInlineToolbarWithoutExtraConfirmation() {
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
             var confirmed: Rect? = null
@@ -189,6 +234,7 @@ class SelectionGestureTest {
                     SelectionOverlayView.Action.COPY -> "复制"
                     SelectionOverlayView.Action.SHARE -> "分享"
                     SelectionOverlayView.Action.SAVE -> "保存到相册"
+                    SelectionOverlayView.Action.CARRY -> "吸入悬浮球"
                 }).performClick()
             }
             assertEquals(SelectionOverlayView.Action.entries.map { expectedRect to it }, observed)

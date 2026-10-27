@@ -119,6 +119,59 @@ class BallView @JvmOverloads constructor(
      * back so the ball can be repositioned as usual.
      */
     var onTap: (() -> Unit)? = null
+    var onCarryDrag: ((View) -> Boolean)? = null
+    var carryingImage: Boolean = false
+    var moveOnly: Boolean = false
+    private var carryDragAttempted = false
+    private var suppressCarryTap = false
+    private var carriedBitmap: Bitmap? = null
+    private val carriedPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+
+    fun setCarriedBitmap(bitmap: Bitmap?) {
+        if (carriedBitmap !== bitmap) carriedBitmap?.recycle()
+        carriedBitmap = bitmap
+        carryingImage = bitmap != null
+        invalidate()
+    }
+
+    private var captureGestureActive = false
+    private var continuousCarryGesture = false
+    private var captureTouchX = 0f
+    private var captureTouchY = 0f
+
+    /** Keep the original input window/stream until the asynchronous screenshot is ready. */
+    fun beginCarryCaptureGesture() {
+        captureTouchX = armX
+        captureTouchY = armY
+        resetToIdle(park = false)
+        captureGestureActive = true
+        continuousCarryGesture = true
+        ignoreUntilNextDown = false
+        // The selection overlay has just disappeared; keep the idle crosshair
+        // from flashing while the screenshot request is being handed off.
+        alpha = 0f
+    }
+
+    fun finishCaptureGesture() {
+        val continued = continuousCarryGesture && captureGestureActive
+        resetToIdle(park = false)
+        captureGestureActive = false
+        continuousCarryGesture = false
+        ignoreUntilNextDown = false
+        carryDragAttempted = !continued
+        suppressCarryTap = true
+        dragStartRawX = captureTouchX
+        dragStartRawY = captureTouchY
+    }
+
+    internal fun resumeCarryDragIfMoved() {
+        if (!carryingImage || carryDragAttempted) return
+        val slop = android.view.ViewConfiguration.get(context).scaledTouchSlop
+        if (kotlin.math.hypot(armX - dragStartRawX, armY - dragStartRawY) > slop) {
+            carryDragAttempted = true
+            onCarryDrag?.invoke(this)
+        }
+    }
 
     /**
      * Optional serial-number badge. When non-null, the ball
@@ -410,6 +463,22 @@ class BallView @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+        val carried = carriedBitmap
+        if (carried != null && !carried.isRecycled) {
+            val cx = width / 2f
+            val cy = height / 2f
+            val side = coreRadiusPx * 2
+            val save = canvas.save()
+            val path = android.graphics.Path().apply { addCircle(cx, cy, coreRadiusPx, android.graphics.Path.Direction.CW) }
+            canvas.clipPath(path)
+            val scale = maxOf(side / carried.width, side / carried.height)
+            val w = carried.width * scale
+            val h = carried.height * scale
+            canvas.drawBitmap(carried, null, android.graphics.RectF(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2), carriedPaint)
+            canvas.restoreToCount(save)
+            canvas.drawCircle(cx, cy, coreRadiusPx, ringPaint.apply { strokeWidth = ringStrokePx })
+            return
+        }
         val cx = width / 2f
         val cy = height / 2f
         val r = coreRadiusPx
@@ -559,7 +628,20 @@ class BallView @JvmOverloads constructor(
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val lp = attachedParams ?: return false
         if (event.actionMasked == MotionEvent.ACTION_DOWN) ignoreUntilNextDown = false
+        if (continuousCarryGesture) {
+            armX = event.rawX
+            armY = event.rawY
+            when (event.actionMasked) {
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN ->
+                    captureGestureActive = false
+                MotionEvent.ACTION_DOWN -> captureGestureActive = false
+            }
+            return true
+        }
         if (ignoreUntilNextDown) return true
+        // Selection/capture owns the stream even when replacing an existing image.
+        if (carryingImage && !moveOnly && state != State.ARMED && state != State.SELECTING)
+            return handleCarriedTouch(event)
         if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
             ignoreUntilNextDown = true
             pendingSelectRect = null
@@ -614,7 +696,7 @@ class BallView @JvmOverloads constructor(
                 armTracker.start(armX, armY, SystemClock.uptimeMillis())
                 state = State.DRAGGING
                 // Every movement outside the jitter tolerance renews this deadline.
-                restartArmTimer()
+                if (!moveOnly) restartArmTimer()
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
@@ -623,7 +705,7 @@ class BallView @JvmOverloads constructor(
                 moveBallWithFinger(event, lp)
                 armX = rawX
                 armY = rawY
-                if (armTracker.move(rawX, rawY, SystemClock.uptimeMillis())) restartArmTimer()
+                if (!moveOnly && armTracker.move(rawX, rawY, SystemClock.uptimeMillis())) restartArmTimer()
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
@@ -642,6 +724,7 @@ class BallView @JvmOverloads constructor(
                             val tap = onTap
                             if (tap != null) {
                                 Log.d(TAG, "ACTION_UP from DRAGGING: tap on ball — firing onTap")
+                                moveOnly = false
                                 tap.invoke()
                                 // Don't snap back — the host
                                 // (PinOverlayService) is about to
@@ -655,6 +738,7 @@ class BallView @JvmOverloads constructor(
                         }
                         Log.d(TAG, "ACTION_UP from DRAGGING: snap back")
                         snapToEdge(lp)
+                        moveOnly = false
                     }
                     State.ARMED -> {
                         // Released after arming: nothing useful happens
@@ -691,6 +775,46 @@ class BallView @JvmOverloads constructor(
     }
 
     /** Set by the host when SELECTING completes; consumed on the next ACTION_UP. */
+    private fun handleCarriedTouch(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                snapAnimator?.cancel()
+                dragStartRawX = event.rawX
+                dragStartRawY = event.rawY
+                carryDragAttempted = false
+                suppressCarryTap = false
+                armX = event.rawX
+                armY = event.rawY
+                state = State.DRAGGING
+                armTracker.start(armX, armY, SystemClock.uptimeMillis())
+                restartArmTimer()
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val slop = android.view.ViewConfiguration.get(context).scaledTouchSlop
+                if (!carryDragAttempted && kotlin.math.hypot(event.rawX - dragStartRawX, event.rawY - dragStartRawY) > slop) {
+                    carryDragAttempted = true
+                    handler.removeCallbacks(armRunnable)
+                    armTracker.cancel()
+                    state = State.IDLE
+                    onCarryDrag?.invoke(this)
+                }
+            }
+            MotionEvent.ACTION_UP -> {
+                handler.removeCallbacks(armRunnable)
+                armTracker.cancel()
+                state = State.IDLE
+                if (!carryDragAttempted && !suppressCarryTap) onTap?.invoke()
+            }
+            MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> {
+                handler.removeCallbacks(armRunnable)
+                armTracker.cancel()
+                state = State.IDLE
+                carryDragAttempted = true
+            }
+        }
+        return true
+    }
+
     internal var pendingSelectRect: android.graphics.Rect? = null
 
     fun enterSelecting() {
@@ -708,7 +832,9 @@ class BallView @JvmOverloads constructor(
         invalidate()
     }
 
-    fun resetToIdle() {
+    fun resetToIdle(park: Boolean = true) {
+        captureGestureActive = false
+        continuousCarryGesture = false
         handler.removeCallbacks(armRunnable)
         armTracker.cancel()
         alpha = 1f
@@ -723,11 +849,13 @@ class BallView @JvmOverloads constructor(
         // DRAGGING-state path — the ARMED/SELECTING branch returns
         // early (it forwards the event to the overlay), so without
         // this line we'd never snap after a real selection.
-        attachedParams?.let { snapToEdge(it) }
+        if (park) attachedParams?.let { snapToEdge(it) }
         invalidate()
     }
 
     override fun onDetachedFromWindow() {
+        carriedBitmap?.recycle()
+        carriedBitmap = null
         snapAnimator?.cancel()
         handler.removeCallbacks(armRunnable)
         armTracker.cancel()
