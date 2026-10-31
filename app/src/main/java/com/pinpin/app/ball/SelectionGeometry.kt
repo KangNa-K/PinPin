@@ -59,24 +59,38 @@ internal object SelectionGeometry {
     /**
      * Moves the edges that [handle] controls by ([dx], [dy]), keeping each
      * edge on screen and at least [minSize] px from the opposite edge.
+     *
+     * The accepted selection is truncated to whole pixels, so at densities
+     * where [minSize] is fractional it can be slightly narrower than
+     * [minSize]. Against a screen edge both limits then can't hold; the screen
+     * edge wins instead of throwing from an empty `coerceIn` range.
      */
     fun resize(
         bounds: Bounds, handle: Handle, dx: Float, dy: Float,
         screenWidth: Int, screenHeight: Int, minSize: Float,
     ): Bounds {
         var (left, top, right, bottom) = bounds
+        val maxX = screenWidth.toFloat()
+        val maxY = screenHeight.toFloat()
         when (handle) {
-            Handle.LEFT, Handle.TOP_LEFT, Handle.BOTTOM_LEFT -> left = (left + dx).coerceIn(0f, right - minSize)
-            Handle.RIGHT, Handle.TOP_RIGHT, Handle.BOTTOM_RIGHT -> right = (right + dx).coerceIn(left + minSize, screenWidth.toFloat())
+            Handle.LEFT, Handle.TOP_LEFT, Handle.BOTTOM_LEFT -> left = clampLow(left + dx, right - minSize)
+            Handle.RIGHT, Handle.TOP_RIGHT, Handle.BOTTOM_RIGHT -> right = clampHigh(right + dx, left + minSize, maxX)
             else -> Unit
         }
         when (handle) {
-            Handle.TOP, Handle.TOP_LEFT, Handle.TOP_RIGHT -> top = (top + dy).coerceIn(0f, bottom - minSize)
-            Handle.BOTTOM, Handle.BOTTOM_LEFT, Handle.BOTTOM_RIGHT -> bottom = (bottom + dy).coerceIn(top + minSize, screenHeight.toFloat())
+            Handle.TOP, Handle.TOP_LEFT, Handle.TOP_RIGHT -> top = clampLow(top + dy, bottom - minSize)
+            Handle.BOTTOM, Handle.BOTTOM_LEFT, Handle.BOTTOM_RIGHT -> bottom = clampHigh(bottom + dy, top + minSize, maxY)
             else -> Unit
         }
         return Bounds(left, top, right, bottom)
     }
+
+    /** [value] in 0..[max]; 0 when the range is empty. */
+    private fun clampLow(value: Float, max: Float): Float = value.coerceIn(0f, max.coerceAtLeast(0f))
+
+    /** [value] in [min]..[screenMax]; [screenMax] when the range is empty. */
+    private fun clampHigh(value: Float, min: Float, screenMax: Float): Float =
+        value.coerceIn(min.coerceAtMost(screenMax), screenMax)
 
     /**
      * Places the action toolbar centred under the selection, or above it when

@@ -205,6 +205,28 @@ class SelectionGestureTest {
         }
     }
 
+    @Test fun narrowSelectionAtScreenEdgeCanBeResizedWithoutCrashing() {
+        // densityDpi 213 makes 16 dp = 21.3 px, but the accepted rect is truncated to 21 px.
+        val app = ApplicationProvider.getApplicationContext<Context>()
+        val config = android.content.res.Configuration(app.resources.configuration).apply { densityDpi = 213 }
+        val context = app.createConfigurationContext(config)
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            var confirmed: Rect? = null
+            var cancelled = 0
+            val view = overlay({ confirmed = it }, { cancelled++ }, context)
+            // A 21 px wide selection against the left screen edge.
+            view.forceArm(0f, 300f)
+            event(view, MotionEvent.ACTION_UP, 21f, 500f)
+            assertEquals(0, cancelled)
+            // Grab the top-left corner and drag 1 px inwards.
+            event(view, MotionEvent.ACTION_DOWN, 0f, 300f)
+            event(view, MotionEvent.ACTION_MOVE, 1f, 300f)
+            event(view, MotionEvent.ACTION_UP, 1f, 300f)
+            control(view, "钉图").performClick()
+            assertEquals(Rect(0, 300, 21, 500), confirmed)
+        }
+    }
+
     private fun control(view: View, description: String): View {
         if (view.contentDescription == description && view.visibility == View.VISIBLE) return view
         if (view is ViewGroup) for (i in 0 until view.childCount) {
@@ -241,8 +263,12 @@ class SelectionGestureTest {
         }
     }
 
-    private fun overlay(confirm: (Rect) -> Unit, cancel: () -> Unit = {}): SelectionOverlayView {
-            val view = SelectionOverlayView(ApplicationProvider.getApplicationContext<Context>())
+    private fun overlay(
+        confirm: (Rect) -> Unit,
+        cancel: () -> Unit = {},
+        context: Context = ApplicationProvider.getApplicationContext(),
+    ): SelectionOverlayView {
+        val view = SelectionOverlayView(context)
         view.layoutParams = view.layoutParamsForScreen(500, 800)
         view.layout(0, 0, 500, 800)
         view.listener = object : SelectionOverlayView.Listener {

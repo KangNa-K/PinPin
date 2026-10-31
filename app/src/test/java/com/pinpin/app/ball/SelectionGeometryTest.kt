@@ -86,6 +86,26 @@ class SelectionGeometryTest {
         assertEquals(Bounds(0f, 0f, 300f, 400f), resize(Handle.TOP_LEFT, -500f, -500f))
     }
 
+    @Test fun resizeNarrowSelectionAtRightEdgeDoesNotThrow() {
+        // At density 1.33125, 16 dp = 21.3 px but the accepted rect is truncated to 21 px.
+        // Clamp range for the right edge was 479 + 21.3 .. 500, i.e. empty.
+        val narrow = Bounds(479f, 300f, 500f, 500f)
+        val result = SelectionGeometry.resize(narrow, Handle.TOP_RIGHT, -1f, 0f, 500, 800, minSize = 21.3f)
+        assertEquals(Bounds(479f, 300f, 500f, 500f), result)
+    }
+
+    @Test fun resizeNarrowSelectionAtLeftEdgeDoesNotThrow() {
+        val narrow = Bounds(0f, 300f, 21f, 500f)
+        val result = SelectionGeometry.resize(narrow, Handle.LEFT, 1f, 0f, 500, 800, minSize = 21.3f)
+        assertEquals(Bounds(0f, 300f, 21f, 500f), result)
+    }
+
+    @Test fun resizeShortSelectionAtBottomEdgeDoesNotThrow() {
+        val short = Bounds(100f, 779f, 300f, 800f)
+        val result = SelectionGeometry.resize(short, Handle.BOTTOM, 0f, -1f, 500, 800, minSize = 21.3f)
+        assertEquals(Bounds(100f, 779f, 300f, 800f), result)
+    }
+
     @Test fun resizeWithoutHandleLeavesBoundsAlone() {
         assertEquals(start, resize(Handle.NONE, 40f, 40f))
     }
