@@ -361,11 +361,7 @@ class BallView @JvmOverloads constructor(
                 Log.w(TAG, "decodeSampledBitmap: invalid bounds ${bounds.outWidth}x${bounds.outHeight}")
                 return null
             }
-            // Compute sample size: largest power-of-two that keeps both
-            // dimensions >= reqSide.
-            var sample = 1
-            val longest = maxOf(bounds.outWidth, bounds.outHeight)
-            while (longest / sample > reqSide * 2) sample *= 2
+            val sample = BallGeometry.sampleSize(bounds.outWidth, bounds.outHeight, reqSide)
             val opts = BitmapFactory.Options().apply {
                 inSampleSize = sample
                 inPreferredConfig = Bitmap.Config.ARGB_8888
@@ -918,19 +914,14 @@ class BallView @JvmOverloads constructor(
      */
     fun snapToEdge(lp: WindowManager.LayoutParams) {
         snapAnimator?.cancel()
-        val centerX = lp.x + width / 2
-        val centerY = lp.y + height / 2
-        val w = attachedDisplayWidth
-        val h = attachedDisplayHeight
-        val (targetX, edge) = if (centerX < w / 2) {
-            // Snap to left edge
-            edgeMarginPx to EDGE_LEFT
-        } else {
-            (w - width - edgeMarginPx) to EDGE_RIGHT
-        }
-        val targetY = lp.y.coerceIn(0, (h - height - edgeMarginPx).coerceAtLeast(0))
-        attachEdge = edge
-        snapAnimator = ValueAnimator.ofInt(lp.x, targetX.coerceIn(0, (w - width).coerceAtLeast(0))).apply {
+        val target = BallGeometry.snapTarget(
+            lp.x, lp.y, width, height,
+            attachedDisplayWidth, attachedDisplayHeight, edgeMarginPx,
+            edgeLeft = EDGE_LEFT, edgeRight = EDGE_RIGHT,
+        )
+        val targetY = target.y
+        attachEdge = target.edge
+        snapAnimator = ValueAnimator.ofInt(lp.x, target.x).apply {
             duration = 220
             interpolator = OvershootInterpolator(1.5f)
             addUpdateListener {

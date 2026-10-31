@@ -28,6 +28,7 @@ import android.view.WindowInsets
 import android.graphics.drawable.GradientDrawable
 import android.widget.ImageButton
 import android.widget.ImageView
+import com.pinpin.app.ball.SelectionGeometry.Handle
 import com.pinpin.app.overlay.PinTheme
 
 /**
@@ -176,7 +177,6 @@ class SelectionOverlayView @JvmOverloads constructor(
         style = Paint.Style.STROKE
         strokeWidth = dp(2f)
     }
-    private enum class Handle { NONE, LEFT, TOP, RIGHT, BOTTOM, TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT }
     private val dimensions = TextView(context).apply {
         setTextColor(Color.WHITE)
         textSize = 14f
@@ -544,55 +544,24 @@ class SelectionOverlayView @JvmOverloads constructor(
 
     private fun nearestHandle(x: Float, y: Float): Handle {
         val r = rect()
-        val threshold = dp(32f)
-        fun near(px: Int, py: Int) = kotlin.math.hypot(x - px, y - py) <= threshold
-        return when {
-            near(r.left, r.top) -> Handle.TOP_LEFT
-            near(r.right, r.top) -> Handle.TOP_RIGHT
-            near(r.left, r.bottom) -> Handle.BOTTOM_LEFT
-            near(r.right, r.bottom) -> Handle.BOTTOM_RIGHT
-            kotlin.math.abs(x - r.left) <= threshold && y in r.top.toFloat()..r.bottom.toFloat() -> Handle.LEFT
-            kotlin.math.abs(x - r.right) <= threshold && y in r.top.toFloat()..r.bottom.toFloat() -> Handle.RIGHT
-            kotlin.math.abs(y - r.top) <= threshold && x in r.left.toFloat()..r.right.toFloat() -> Handle.TOP
-            kotlin.math.abs(y - r.bottom) <= threshold && x in r.left.toFloat()..r.right.toFloat() -> Handle.BOTTOM
-            else -> Handle.NONE
-        }
+        return SelectionGeometry.nearestHandle(x, y, r.left, r.top, r.right, r.bottom, threshold = dp(32f))
     }
 
     private fun adjust(x: Float, y: Float) {
         val dx = x - lastAdjustX
         val dy = y - lastAdjustY
         if (activeHandle == Handle.NONE && !movingSelection) return
-        val r = rect()
-        if (movingSelection) {
-            val w = currentX - originX
-            val h = currentY - originY
-            val left = (originX + dx).coerceIn(0f, (screenWidth - w).coerceAtLeast(0f))
-            val top = (originY + dy).coerceIn(0f, (screenHeight - h).coerceAtLeast(0f))
-            originX = left
-            originY = top
-            currentX = left + w
-            currentY = top + h
+        // While adjusting, origin is the top-left and current the bottom-right.
+        val bounds = SelectionGeometry.Bounds(originX, originY, currentX, currentY)
+        val next = if (movingSelection) {
+            SelectionGeometry.move(bounds, dx, dy, screenWidth, screenHeight)
         } else {
-            var left = originX
-            var top = originY
-            var right = currentX
-            var bottom = currentY
-            when (activeHandle) {
-                Handle.LEFT, Handle.TOP_LEFT, Handle.BOTTOM_LEFT -> left = (left + dx).coerceIn(0f, right - dp(16f))
-                Handle.RIGHT, Handle.TOP_RIGHT, Handle.BOTTOM_RIGHT -> right = (right + dx).coerceIn(left + dp(16f), screenWidth.toFloat())
-                else -> Unit
-            }
-            when (activeHandle) {
-                Handle.TOP, Handle.TOP_LEFT, Handle.TOP_RIGHT -> top = (top + dy).coerceIn(0f, bottom - dp(16f))
-                Handle.BOTTOM, Handle.BOTTOM_LEFT, Handle.BOTTOM_RIGHT -> bottom = (bottom + dy).coerceIn(top + dp(16f), screenHeight.toFloat())
-                else -> Unit
-            }
-            originX = left
-            originY = top
-            currentX = right
-            currentY = bottom
+            SelectionGeometry.resize(bounds, activeHandle, dx, dy, screenWidth, screenHeight, minSize = dp(16f))
         }
+        originX = next.left
+        originY = next.top
+        currentX = next.right
+        currentY = next.bottom
         lastAdjustX = x
         lastAdjustY = y
         updateDimensions()
@@ -664,20 +633,22 @@ class SelectionOverlayView @JvmOverloads constructor(
         val toolbar = actionToolbar.layoutParams as LayoutParams
         val margin = dp(12f).toInt()
         val toolbarWidth = dp(actionToolbar.childCount * 40f + 8f).toInt()
-        val localLeft = selection.left - screenLocation[0]
-        val localTop = selection.top - screenLocation[1]
-        val localBottom = selection.bottom - screenLocation[1]
-        val localScreenWidth = width.takeIf { it > 0 } ?: screenWidth
-        val localScreenHeight = height.takeIf { it > 0 } ?: screenHeight
-        val left = ((localLeft + selection.width() / 2 - toolbarWidth / 2))
-            .coerceIn(margin, (localScreenWidth - toolbarWidth - margin).coerceAtLeast(margin))
-        val below = localBottom + margin
-        val above = localTop - margin - dp(40f).toInt()
+        val toolbarHeight = dp(40f).toInt()
+        val position = SelectionGeometry.toolbarPosition(
+            selectionLeft = selection.left - screenLocation[0],
+            selectionTop = selection.top - screenLocation[1],
+            selectionBottom = selection.bottom - screenLocation[1],
+            selectionWidth = selection.width(),
+            toolbarWidth = toolbarWidth,
+            toolbarHeight = toolbarHeight,
+            margin = margin,
+            windowWidth = width.takeIf { it > 0 } ?: screenWidth,
+            windowHeight = height.takeIf { it > 0 } ?: screenHeight,
+        )
         toolbar.width = toolbarWidth
-        toolbar.height = dp(40f).toInt()
-        toolbar.leftMargin = left
-        toolbar.topMargin = if (below + toolbar.height <= localScreenHeight) below
-        else above.coerceAtLeast(margin)
+        toolbar.height = toolbarHeight
+        toolbar.leftMargin = position.left
+        toolbar.topMargin = position.top
         actionToolbar.layoutParams = toolbar
     }
 
