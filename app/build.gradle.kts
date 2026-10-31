@@ -6,6 +6,7 @@ plugins {
     alias(libs.plugins.compose.compiler)
     alias(libs.plugins.ksp)
     alias(libs.plugins.hilt)
+    alias(libs.plugins.kover)
 }
 
 android {
@@ -140,4 +141,21 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.espresso)
     androidTestImplementation(libs.compose.ui.test.junit4)
+}
+
+// JVM unit-test coverage. Instrumented tests are not included by Kover.
+// Reports: ./gradlew koverHtmlReportDebug / koverXmlReportDebug
+kover {
+    reports {
+        filters {
+            excludes {
+                annotatedBy("*Generated*")
+                classes(
+                    "*Hilt_*", "*_Factory*", "*_HiltModules*", "*_MembersInjector",
+                    "dagger.hilt.*", "hilt_aggregated_deps.*", "*.BuildConfig",
+                    "*ComposableSingletons*", "*_Impl*",
+                )
+            }
+        }
+    }
 }

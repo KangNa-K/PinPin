@@ -1280,11 +1280,23 @@ class PinWindowView(
         val metrics = windowManager.currentWindowMetrics
         val screenW = metrics.bounds.width()
         val screenH = metrics.bounds.height()
+        // Keep the canvas, close button and annotation toolbar clear of the
+        // status/navigation bars and cutouts. Those system windows sit above
+        // TYPE_APPLICATION_OVERLAY and would swallow taps on controls drawn
+        // underneath them (e.g. the X button landing under the status bar).
+        val insets = metrics.windowInsets.getInsetsIgnoringVisibility(
+            android.view.WindowInsets.Type.systemBars() or
+                android.view.WindowInsets.Type.displayCutout(),
+        )
+        // The wrapper is centred on the full screen width, so reserve the
+        // larger horizontal inset on both sides to keep the fit symmetric.
+        val horizontalInset = maxOf(insets.left, insets.right)
         val padding = (resources.displayMetrics.density * 32).toInt()
         val toolbarOverheadForFit =
             dpToPx(TOOLBAR_GAP_DP) * 2 + dpToPx(TOOLBAR_HEIGHT_DP)
-        val maxW = (screenW - padding * 2).coerceAtLeast(1)
-        val maxH = (screenH - padding * 2 - toolbarOverheadForFit).coerceAtLeast(1)
+        val availableH = (screenH - insets.top - insets.bottom).coerceAtLeast(1)
+        val maxW = (screenW - horizontalInset * 2 - padding * 2).coerceAtLeast(1)
+        val maxH = (availableH - padding * 2 - toolbarOverheadForFit).coerceAtLeast(1)
         val aspect = if (currentH > 0) currentW.toFloat() / currentH.toFloat() else 1f
         val fitW: Int
         val fitH: Int
@@ -1301,7 +1313,7 @@ class PinWindowView(
         // toolbar below the visible area on tall images.
         val fitX = (screenW - fitW) / 2
         val groupHeight = fitH + dpToPx(TOOLBAR_GAP_DP) + dpToPx(TOOLBAR_HEIGHT_DP)
-        val fitY = ((screenH - groupHeight) / 2).coerceAtLeast(padding)
+        val fitY = insets.top + ((availableH - groupHeight) / 2).coerceAtLeast(padding)
 
         // Apply the zoom.
         currentW = fitW

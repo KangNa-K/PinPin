@@ -1,12 +1,19 @@
 package com.pinpin.app.capture
 
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.File
 import javax.imageio.ImageIO
 
+/**
+ * Manual diagnostic against a local screen-recording frame. Skipped unless the
+ * frame exists, so normal unit-test runs do not depend on machine-local files.
+ */
 class ImageRegionDetectorScratchTest {
     @Test fun inspectRecordingFrame() {
-        val image = ImageIO.read(File("/tmp/pinpin-rednote/frame-8.png"))
+        val frame = File("/tmp/pinpin-rednote/frame-8.png")
+        assumeTrue("Local recording frame not present: $frame", frame.isFile)
+        val image = ImageIO.read(frame)
         val w = 480
         val h = image.height * w / image.width
         val pixels = IntArray(w * h)
