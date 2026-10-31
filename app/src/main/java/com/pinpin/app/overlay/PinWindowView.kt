@@ -42,8 +42,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.withContext
-import kotlin.math.abs
-import kotlin.math.hypot
 import kotlin.math.roundToInt
 import java.util.Locale
 
@@ -719,12 +717,10 @@ class PinWindowView(
     private fun arrangeImageActions(width: Int) {
         val size = dpToPx(CLOSE_BUTTON_SIZE_DP)
         val margin = dpToPx(CLOSE_BUTTON_MARGIN_DP)
-        val step = size + dpToPx(4f)
-        val columns = ((width - margin * 2 + dpToPx(4f)) / step).coerceIn(1, 4)
+        val spacing = dpToPx(4f)
         // Keep close at the top-right; fill each row towards the left.
         (imageActionButtons + closeButton).asReversed().forEachIndexed { index, button ->
-            val end = margin + (index % columns) * step
-            val top = margin + (index / columns) * step
+            val (end, top) = PinWindowGeometry.imageActionSlot(index, width, size, margin, spacing)
             val params = button.layoutParams as LayoutParams
             if (params.marginEnd != end || params.topMargin != top || params.gravity != (Gravity.TOP or Gravity.END)) {
                 button.layoutParams = LayoutParams(size, size).apply {
@@ -2067,16 +2063,11 @@ class PinWindowView(
     // Touch handling
     // ----------------------------------------------------------------
     private fun isImageGestureTarget(x: Float, y: Float): Boolean {
-        if (x < imageCard.left || x >= imageCard.right ||
-            y < imageCard.top || y >= imageCard.bottom
-        ) return false
-        val imageX = x - imageCard.left
-        val imageY = y - imageCard.top
-        return (imageActionButtons + closeButton).none {
-            it.visibility == View.VISIBLE && it.isEnabled &&
-                imageX >= it.left && imageX < it.right &&
-                imageY >= it.top && imageY < it.bottom
-        }
+        val controls = (imageActionButtons + closeButton)
+            .filter { it.visibility == View.VISIBLE && it.isEnabled }
+            .map { PinWindowGeometry.Box(it.left, it.top, it.right, it.bottom) }
+        val card = PinWindowGeometry.Box(imageCard.left, imageCard.top, imageCard.right, imageCard.bottom)
+        return PinWindowGeometry.isImageBodyHit(x, y, card, controls)
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -2197,10 +2188,11 @@ class PinWindowView(
             MotionEvent.ACTION_MOVE -> {
                 if (!interacting) return false
                 if (cornerDragIndex >= 0) {
-                    if (!cornerMoved && hypot(
+                    if (!cornerMoved && PinWindowGeometry.cornerDragStarted(
                             event.rawX - cornerDragDownFingerX,
                             event.rawY - cornerDragDownFingerY,
-                        ) > ViewConfiguration_getScaledTouchSlop()
+                            ViewConfiguration_getScaledTouchSlop(),
+                        )
                     ) cornerMoved = true
                     if (cornerMoved) applyCornerDrag(event.rawX, event.rawY)
                 } else if (!spec.locked) {
@@ -2209,11 +2201,7 @@ class PinWindowView(
                     // tap-to-toggle on UP is unaffected.
                     val dx = (event.rawX - downRawX).toInt()
                     val dy = (event.rawY - downRawY).toInt()
-                    if (!dragged && (
-                        abs(dx) > ViewConfiguration_getScaledTouchSlop() ||
-                            abs(dy) > ViewConfiguration_getScaledTouchSlop()
-                        )
-                    ) {
+                    if (!dragged && PinWindowGeometry.bodyDragStarted(dx, dy, ViewConfiguration_getScaledTouchSlop())) {
                         dragged = true
                     }
                     if (dragged) {

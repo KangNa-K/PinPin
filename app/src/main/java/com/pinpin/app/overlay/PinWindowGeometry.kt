@@ -1,5 +1,7 @@
 package com.pinpin.app.overlay
 
+import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 /**
@@ -136,4 +138,42 @@ internal object PinWindowGeometry {
         val fitY = insetTop + ((availableH - groupHeight) / 2).coerceAtLeast(padding)
         return Frame(fitX, fitY, fitW, fitH)
     }
+
+    /** Child bounds in image-card pixels, right/bottom exclusive. */
+    data class Box(val left: Int, val top: Int, val right: Int, val bottom: Int)
+
+    /** Top-right-anchored slot of one image action button. */
+    data class ActionSlot(val marginEnd: Int, val topMargin: Int)
+
+    /**
+     * Grid slot for the [index]-th image action button, counted from the
+     * top-right corner (index 0 is the close button). Buttons fill each row
+     * leftwards, 1 to 4 per row depending on [imageWidth].
+     */
+    fun imageActionSlot(index: Int, imageWidth: Int, buttonSize: Int, margin: Int, spacing: Int): ActionSlot {
+        val step = buttonSize + spacing
+        val columns = ((imageWidth - margin * 2 + spacing) / step).coerceIn(1, 4)
+        return ActionSlot(
+            marginEnd = margin + (index % columns) * step,
+            topMargin = margin + (index / columns) * step,
+        )
+    }
+
+    /**
+     * True when a DOWN at wrapper point ([x], [y]) lands on the image body:
+     * inside [card] and outside every [controls] box (image-card pixels).
+     * Edges follow view bounds: left/top inclusive, right/bottom exclusive.
+     */
+    fun isImageBodyHit(x: Float, y: Float, card: Box, controls: List<Box>): Boolean {
+        if (x < card.left || x >= card.right || y < card.top || y >= card.bottom) return false
+        val imageX = x - card.left
+        val imageY = y - card.top
+        return controls.none { imageX >= it.left && imageX < it.right && imageY >= it.top && imageY < it.bottom }
+    }
+
+    /** A body drag starts once the whole-pixel offset passes [slop] on either axis. */
+    fun bodyDragStarted(dx: Int, dy: Int, slop: Int): Boolean = abs(dx) > slop || abs(dy) > slop
+
+    /** A corner drag starts once the finger has travelled more than [slop] px. */
+    fun cornerDragStarted(dx: Float, dy: Float, slop: Int): Boolean = hypot(dx, dy) > slop
 }

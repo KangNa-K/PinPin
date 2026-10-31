@@ -4,9 +4,12 @@ import com.pinpin.app.overlay.PinWindowGeometry.CORNER_BL
 import com.pinpin.app.overlay.PinWindowGeometry.CORNER_BR
 import com.pinpin.app.overlay.PinWindowGeometry.CORNER_TL
 import com.pinpin.app.overlay.PinWindowGeometry.CORNER_TR
+import com.pinpin.app.overlay.PinWindowGeometry.ActionSlot
+import com.pinpin.app.overlay.PinWindowGeometry.Box
 import com.pinpin.app.overlay.PinWindowGeometry.Frame
 import com.pinpin.app.overlay.PinWindowGeometry.NO_CORNER
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -105,6 +108,65 @@ class PinWindowGeometryTest {
         val fit = fit(width = 100, height = 0)
         assertEquals(888, fit.width)
         assertEquals(888, fit.height)
+    }
+
+    // 60 px buttons, 12 px margin, 6 px spacing (density 1.5): step 66.
+    private fun slot(index: Int, width: Int) =
+        PinWindowGeometry.imageActionSlot(index, width, buttonSize = 60, margin = 12, spacing = 6)
+
+    @Test fun imageActionsFillRowsLeftwardsFromTopRight() {
+        // (300 - 24 + 6) / 66 = 4 columns
+        assertEquals(ActionSlot(12, 12), slot(0, 300))
+        assertEquals(ActionSlot(210, 12), slot(3, 300))
+        // (150 - 24 + 6) / 66 = 2 columns
+        assertEquals(ActionSlot(78, 12), slot(1, 150))
+        assertEquals(ActionSlot(12, 78), slot(2, 150))
+        assertEquals(ActionSlot(78, 78), slot(3, 150))
+    }
+
+    @Test fun imageActionColumnsAreClampedBetweenOneAndFour() {
+        // Two columns start at exactly 150 px: (150 - 24 + 6) / 66 = 2.
+        assertEquals(ActionSlot(12, 78), slot(1, 149))
+        assertEquals(ActionSlot(78, 12), slot(1, 150))
+        assertEquals(ActionSlot(12, 210), slot(3, 0))
+        assertEquals(ActionSlot(12, 78), slot(4, 2000))
+    }
+
+    private val card = Box(0, 0, 300, 200)
+    private val close = Box(248, 8, 288, 48)
+
+    @Test fun imageBodyHitExcludesVisibleControls() {
+        assertTrue(PinWindowGeometry.isImageBodyHit(150f, 100f, card, listOf(close)))
+        assertFalse(PinWindowGeometry.isImageBodyHit(260f, 20f, card, listOf(close)))
+        // Control right/bottom edges are exclusive.
+        assertTrue(PinWindowGeometry.isImageBodyHit(288f, 20f, card, listOf(close)))
+        // A hidden control is simply not passed in.
+        assertTrue(PinWindowGeometry.isImageBodyHit(260f, 20f, card, emptyList()))
+    }
+
+    @Test fun imageBodyHitRejectsPointsOutsideTheCard() {
+        assertTrue(PinWindowGeometry.isImageBodyHit(0f, 0f, card, emptyList()))
+        assertFalse(PinWindowGeometry.isImageBodyHit(300f, 100f, card, emptyList()))
+        assertFalse(PinWindowGeometry.isImageBodyHit(150f, 200f, card, emptyList()))
+        assertFalse(PinWindowGeometry.isImageBodyHit(-0.5f, 100f, card, emptyList()))
+    }
+
+    @Test fun imageBodyHitMapsControlsIntoCardCoordinates() {
+        val offsetCard = Box(10, 20, 310, 220)
+        assertFalse(PinWindowGeometry.isImageBodyHit(270f, 40f, offsetCard, listOf(close)))
+        assertTrue(PinWindowGeometry.isImageBodyHit(260f, 20f, offsetCard, listOf(close)))
+    }
+
+    @Test fun bodyDragNeedsOneAxisPastSlop() {
+        assertFalse(PinWindowGeometry.bodyDragStarted(16, 16, slop = 16))
+        assertTrue(PinWindowGeometry.bodyDragStarted(17, 0, slop = 16))
+        assertTrue(PinWindowGeometry.bodyDragStarted(0, -17, slop = 16))
+    }
+
+    @Test fun cornerDragUsesTravelDistance() {
+        // hypot(12, 12) = 16.97 > 16 although neither axis passes the slop.
+        assertTrue(PinWindowGeometry.cornerDragStarted(12f, 12f, slop = 16))
+        assertFalse(PinWindowGeometry.cornerDragStarted(16f, 0f, slop = 16))
     }
 
     private fun resize(
