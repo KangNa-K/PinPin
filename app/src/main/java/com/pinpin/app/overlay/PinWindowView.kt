@@ -1288,32 +1288,25 @@ class PinWindowView(
             android.view.WindowInsets.Type.systemBars() or
                 android.view.WindowInsets.Type.displayCutout(),
         )
-        // The wrapper is centred on the full screen width, so reserve the
-        // larger horizontal inset on both sides to keep the fit symmetric.
-        val horizontalInset = maxOf(insets.left, insets.right)
-        val padding = (resources.displayMetrics.density * 32).toInt()
-        val toolbarOverheadForFit =
-            dpToPx(TOOLBAR_GAP_DP) * 2 + dpToPx(TOOLBAR_HEIGHT_DP)
-        val availableH = (screenH - insets.top - insets.bottom).coerceAtLeast(1)
-        val maxW = (screenW - horizontalInset * 2 - padding * 2).coerceAtLeast(1)
-        val maxH = (availableH - padding * 2 - toolbarOverheadForFit).coerceAtLeast(1)
-        val aspect = if (currentH > 0) currentW.toFloat() / currentH.toFloat() else 1f
-        val fitW: Int
-        val fitH: Int
-        if (maxW.toFloat() / maxH.toFloat() > aspect) {
-            fitH = maxH
-            fitW = (maxH * aspect).toInt()
-        } else {
-            fitW = maxW
-            fitH = (maxW / aspect).toInt()
-        }
-
-        // Centre the image and its bottom toolbar as one group.
-        // Centering the image in the full screen would place the
-        // toolbar below the visible area on tall images.
-        val fitX = (screenW - fitW) / 2
-        val groupHeight = fitH + dpToPx(TOOLBAR_GAP_DP) + dpToPx(TOOLBAR_HEIGHT_DP)
-        val fitY = insets.top + ((availableH - groupHeight) / 2).coerceAtLeast(padding)
+        // Centre the image and its bottom toolbar as one group inside the
+        // safe area; see [PinWindowGeometry.annotationFit].
+        val fit = PinWindowGeometry.annotationFit(
+            screenWidth = screenW,
+            screenHeight = screenH,
+            insetLeft = insets.left,
+            insetTop = insets.top,
+            insetRight = insets.right,
+            insetBottom = insets.bottom,
+            padding = (resources.displayMetrics.density * 32).toInt(),
+            toolbarGap = dpToPx(TOOLBAR_GAP_DP),
+            toolbarHeight = dpToPx(TOOLBAR_HEIGHT_DP),
+            currentWidth = currentW,
+            currentHeight = currentH,
+        )
+        val fitX = fit.x
+        val fitY = fit.y
+        val fitW = fit.width
+        val fitH = fit.height
 
         // Apply the zoom.
         currentW = fitW
@@ -2174,8 +2167,11 @@ class PinWindowView(
                     // aspect-preserving geometry.
                     cornerDragIndex = cornerIndex
                     cornerMoved = false
-                    cornerDragAnchorX = (downLayoutX + if (cornerIndex == CORNER_TL || cornerIndex == CORNER_BL) currentW else 0).toFloat()
-                    cornerDragAnchorY = (downLayoutY + if (cornerIndex == CORNER_TL || cornerIndex == CORNER_TR) currentH else 0).toFloat()
+                    val (anchorX, anchorY) = PinWindowGeometry.oppositeAnchor(
+                        cornerIndex, downLayoutX, downLayoutY, currentW, currentH,
+                    )
+                    cornerDragAnchorX = anchorX
+                    cornerDragAnchorY = anchorY
                     cornerDragDownFingerX = event.rawX
                     cornerDragDownFingerY = event.rawY
                     cornerDragInitialW = currentW
@@ -2334,11 +2330,6 @@ class PinWindowView(
      */
     private fun hitTestCorner(localX: Float, localY: Float): Int {
         if (currentW <= 0 || currentH <= 0) return -1
-        val r = dpToPx(CORNER_HIT_RADIUS_DP).toFloat()
-        val rSq = r * r
-        val w = currentW.toFloat()
-        val h = currentH.toFloat()
-        val inset = cornerRadiusPx
         // Map wrapper-local touch coords into imageCard-local coords.
         // imageCard is the first child at (0,0) with size (currentW, currentH).
         val imgX = localX - imageCard.left
@@ -2347,35 +2338,23 @@ class PinWindowView(
                 it.visibility == View.VISIBLE && it.isEnabled &&
                     imgX >= it.left && imgX < it.right && imgY >= it.top && imgY < it.bottom
             }) return -1
-        val positions = arrayOf(
-            inset to inset,         // TL
-            w - inset to inset,     // TR
-            inset to h - inset,     // BL
-            w - inset to h - inset, // BR
+        val corner = PinWindowGeometry.cornerAt(
+            imgX, imgY, currentW, currentH,
+            inset = cornerRadiusPx,
+            hitRadius = dpToPx(CORNER_HIT_RADIUS_DP).toFloat(),
         )
-        for ((i, p) in positions.withIndex()) {
-            val dx = imgX - p.first
-            val dy = imgY - p.second
-            if (dx * dx + dy * dy <= rSq) {
-                // The close button sits in the TR corner area, which
-                // overlaps the TR handle's hit region. Only suppress
-                // the handle when the user actually tapped *inside*
-                // the close button — and only when the toolbar is
-                // shown (the close button is alpha 0 / not useful
-                // otherwise). The close button is a child of
-                // imageCard so the same imgX/imgY coords apply.
-                if (i == CORNER_TR && toolbarShown) {
-                    val cb = closeButtonRect()
-                    if (imgX >= cb.left && imgX <= cb.right &&
-                        imgY >= cb.top && imgY <= cb.bottom
-                    ) {
-                        return -1
-                    }
-                }
-                return i
+        // The close button sits in the TR corner area, which overlaps the
+        // TR handle's hit region. Only suppress the handle when the user
+        // actually tapped *inside* the close button, and only when the
+        // toolbar is shown (the button is alpha 0 otherwise). The close
+        // button is a child of imageCard so the same imgX/imgY coords apply.
+        if (corner == CORNER_TR && toolbarShown) {
+            val cb = closeButtonRect()
+            if (imgX >= cb.left && imgX <= cb.right && imgY >= cb.top && imgY <= cb.bottom) {
+                return -1
             }
         }
-        return -1
+        return corner
     }
 
     private fun closeButtonRect(): android.graphics.RectF {
@@ -2414,52 +2393,21 @@ class PinWindowView(
         val index = cornerDragIndex
         if (index < 0) return
 
-        val initialW = cornerDragInitialW.coerceAtLeast(1)
-        val initialH = cornerDragInitialH.coerceAtLeast(1)
-        val initialWf = initialW.toFloat()
-        val initialHf = initialH.toFloat()
-        val dx = (fingerX - cornerDragDownFingerX) * if (index == CORNER_TL || index == CORNER_BL) -1f else 1f
-        val dy = (fingerY - cornerDragDownFingerY) * if (index == CORNER_TL || index == CORNER_TR) -1f else 1f
-        val rawScale = 1f + (dx * initialWf + dy * initialHf) /
-            (initialWf * initialWf + initialHf * initialHf)
-        val minScaleForW = minOf(MIN_SIZE, initialW).toFloat() / initialWf
-        val minScaleForH = minOf(MIN_SIZE, initialH).toFloat() / initialHf
-        val maxScaleForW = MAX_SIZE.toFloat() / initialWf
-        val maxScaleForH = MAX_SIZE.toFloat() / initialHf
-        val maxScale = minOf(maxScaleForW, maxScaleForH)
-        val minScale = minOf(maxOf(minScaleForW, minScaleForH), maxScale)
-        val scaleFactor = rawScale.coerceIn(minScale, maxScale)
-
-        // Compute new dimensions preserving the initial aspect ratio exactly.
-        // Use the aspect ratio captured at drag start so that floating-point
-        // drift from repeated toInt() truncation does not accumulate.
-        val newWf = initialWf * scaleFactor
-        val newHf = initialHf * scaleFactor
-
-        val newW = newWf.roundToInt().coerceAtLeast(1)
-        val newH = newHf.roundToInt().coerceAtLeast(1)
-
-        var newX: Int
-        var newY: Int
-        when (index) {
-            CORNER_TL -> {
-                newX = (cornerDragAnchorX - newW).toInt()
-                newY = (cornerDragAnchorY - newH).toInt()
-            }
-            CORNER_TR -> {
-                newX = cornerDragAnchorX.toInt()
-                newY = (cornerDragAnchorY - newH).toInt()
-            }
-            CORNER_BL -> {
-                newX = (cornerDragAnchorX - newW).toInt()
-                newY = cornerDragAnchorY.toInt()
-            }
-            CORNER_BR -> {
-                newX = cornerDragAnchorX.toInt()
-                newY = cornerDragAnchorY.toInt()
-            }
-            else -> return
-        }
+        val frame = PinWindowGeometry.resizeFromCorner(
+            corner = index,
+            anchorX = cornerDragAnchorX,
+            anchorY = cornerDragAnchorY,
+            initialWidth = cornerDragInitialW,
+            initialHeight = cornerDragInitialH,
+            fingerDx = fingerX - cornerDragDownFingerX,
+            fingerDy = fingerY - cornerDragDownFingerY,
+            minSize = MIN_SIZE,
+            maxSize = MAX_SIZE,
+        ) ?: return
+        val newW = frame.width
+        val newH = frame.height
+        var newX = frame.x
+        var newY = frame.y
         // Corner drags used to bypass the same bounds check as body drags.
         // When a finger crossed a screen edge, the resulting WindowManager
         // coordinates could move most of the pin off-screen and look like
@@ -2493,12 +2441,7 @@ class PinWindowView(
         // (the user might still want to see it / tap it).
         val toolbarOverhead = dpToPx(TOOLBAR_GAP_DP) + toolbarRows(w) * dpToPx(TOOLBAR_HEIGHT_DP)
         val wrapperH = h + toolbarOverhead
-        val wrapperW = w
-        val maxX = bounds.right - wrapperW / 4
-        val minX = -wrapperW + wrapperW / 4
-        val maxY = bounds.bottom - wrapperH / 4
-        val minY = -wrapperH + wrapperH / 4
-        return x.coerceIn(minX, maxX) to y.coerceIn(minY, maxY)
+        return PinWindowGeometry.clampPosition(x, y, w, wrapperH, bounds.right, bounds.bottom)
     }
 
     private fun applyLayoutPosition(x: Int, y: Int) {
@@ -2675,11 +2618,11 @@ class PinWindowView(
         private const val TOOLBAR_ANIM_TRANSLATE_DP = 16f
 
         // Corner-drag indices.
-        private const val NO_CORNER_DRAG = -1
-        private const val CORNER_TL = 0
-        private const val CORNER_TR = 1
-        private const val CORNER_BL = 2
-        private const val CORNER_BR = 3
+        private const val NO_CORNER_DRAG = PinWindowGeometry.NO_CORNER
+        private const val CORNER_TL = PinWindowGeometry.CORNER_TL
+        private const val CORNER_TR = PinWindowGeometry.CORNER_TR
+        private const val CORNER_BL = PinWindowGeometry.CORNER_BL
+        private const val CORNER_BR = PinWindowGeometry.CORNER_BR
 
         // Toolbar action ids — passed to [onActionClicked] verbatim.
         // The host (PinOverlayService) is responsible for dispatching
