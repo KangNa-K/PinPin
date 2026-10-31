@@ -261,6 +261,46 @@ class AnnotationExitTest {
         }
     }
 
+    @Test fun pickedColourDrivesCanvasAndCarriesIntoNextSession() = onMain {
+        val blue = android.graphics.Color.parseColor("#2196F3")
+        val view = pin()
+        view.enterAnnotationMode()
+        try {
+            val children = descendants(view)
+            val canvas = children.filterIsInstance<DrawingOverlayView>().single()
+            assertEquals(android.graphics.Color.RED, canvas.strokeColor)
+            children.single { it.contentDescription == "蓝" }.performClick()
+            assertEquals(blue, canvas.strokeColor)
+        } finally {
+            view.exitAnnotationMode(discardChanges = true)
+        }
+        view.enterAnnotationMode()
+        try {
+            val canvas = descendants(view).filterIsInstance<DrawingOverlayView>().single()
+            assertEquals(blue, canvas.strokeColor)
+        } finally {
+            view.exitAnnotationMode(discardChanges = true)
+        }
+    }
+
+    @Test fun brushSliderSetsCanvasStrokeWidth() = onMain {
+        val view = pin()
+        view.enterAnnotationMode()
+        try {
+            val children = descendants(view)
+            val canvas = children.filterIsInstance<DrawingOverlayView>().single()
+            val slider = children.filterIsInstance<android.widget.SeekBar>().single()
+            assertEquals("笔刷大小", slider.contentDescription)
+            assertEquals(18, slider.progress)
+            slider.progress = 100
+            assertEquals(24f, canvas.strokeWidth, 0.001f)
+            slider.progress = 0
+            assertEquals(2f, canvas.strokeWidth, 0.001f)
+        } finally {
+            view.exitAnnotationMode(discardChanges = true)
+        }
+    }
+
     @Test fun exitActionsFitNarrowScreenWithoutScrollingTools() = onMain {
         val view = pin()
         view.enterAnnotationMode()

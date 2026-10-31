@@ -1361,7 +1361,7 @@ class PinWindowView(
         closeButton.bringToFront()
 
         // 4. Show annotation toolbar
-        val annToolbar = buildAnnotationToolbar()
+        val annToolbar = buildAnnotationToolbar(overlay).view
         addView(annToolbar, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             dpToPx(TOOLBAR_HEIGHT_DP),
@@ -1420,8 +1420,6 @@ class PinWindowView(
             drawingOverlay = null
             annotationToolbar?.let { removeView(it) }
             annotationToolbar = null
-            annotationPenButton = null
-            annotationEraserButton = null
 
             currentW = preAnnotationW
             currentH = preAnnotationH
@@ -1500,139 +1498,24 @@ class PinWindowView(
 
     fun isAnnotationMode(): Boolean = annotationMode
 
-    private var annotationPenButton: View? = null
-    private var annotationEraserButton: View? = null
-
     /**
-     * The color currently selected on the annotation toolbar's 8
-     * swatch row. Updated when the user taps a swatch; the toolbar
-     * is rebuilt only on entry to annotation mode, so the active
-     * ring is updated in place by re-tagging the swatch views
-     * (see [refreshSwatchSelection]). Default mirrors the historical
-     * red swatch on the first two swatches of the old toolbar, so
-     * an existing user picks up the same color they had before.
+     * The last colour picked on the annotation toolbar. Kept here, not in the
+     * toolbar, so the next annotation session starts with the same colour.
      */
     private var selectedAnnotationColor: Int = Color.RED
 
-    /**
-     * The eight swatch views on the annotation toolbar, kept by
-     * reference so [refreshSwatchSelection] can update their ring
-     * stroke (3dp white when selected, 1dp 33%-white otherwise)
-     * without rebuilding the toolbar. Indexed by their position in
-     * [ANNOTATION_SWATCH_COLORS].
-     */
-    private val swatchViews: MutableList<View> = mutableListOf()
-
-    /** Scrollable drawing tools with fixed save, apply and cancel actions. */
-    private fun buildAnnotationToolbar(): LinearLayout {
-        val density = resources.displayMetrics.density
-        val toolbar = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            // Theme-aware surface so the toolbar blends with the
-            // rest of the pin UI in both light and dark mode.
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                setColor(theme.surfaceFill)
-                cornerRadius = dpToPx(24f).toFloat()
-                setStroke(dpToPx(1), theme.surfaceStroke)
-            }
-            clipToOutline = true
-            elevation = 0f
-            // Horizontal padding so the toolbar pill doesn't
-            // touch the screen edges when the wrapper is full
-            // screen width.
-            val hPad = (12 * density).toInt()
-            setPadding(hPad, 0, hPad, 0)
-        }
-
-        // ---- Main row ----
-        val mainRow = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        // 1-8. 8-swatch color row (red, black, orange, yellow, green,
-        //      cyan, blue, purple). The active swatch shows a 3dp
-        //      white ring; the others show a 1dp 33%-white ring.
-        //      Selection state is held in [selectedAnnotationColor]
-        //      and re-applied to the swatches by
-        //      [refreshSwatchSelection] on every change.
-        swatchViews.clear()
-        val palette = ANNOTATION_SWATCH_COLORS
-        val swatchLabels = arrayOf("红", "黑", "橙", "黄", "绿", "青", "蓝", "紫")
-        for (i in palette.indices) {
-            val color = palette[i]
-            val label = swatchLabels[i]
-            val swatch = makeColorSwatch(
-                color = color,
-                label = label,
-                isSelected = color == selectedAnnotationColor,
-                onPick = { selectAnnotationColor(color) },
-            )
-            swatchViews.add(swatch)
-            mainRow.addView(swatch)
-        }
-        mainRow.addView(makeVerticalDivider())
-        // Shape recognition is built into the pen, not a separate tool.
-        annotationPenButton = makeAnnotationActionButton(R.drawable.ic_action_annotate, "签字笔") {
-            selectAnnotationMode(DrawingOverlayView.Mode.PEN)
-        }.also { mainRow.addView(it) }
-        annotationEraserButton = makeAnnotationActionButton(R.drawable.ic_action_eraser, "橡皮擦") {
-            selectAnnotationMode(DrawingOverlayView.Mode.ERASER)
-        }.also { mainRow.addView(it) }
-        refreshAnnotationModeSelection()
-        // 4b. Brush-size slider. Both pen and eraser read
-        //     strokeWidth off the same drawingOverlay, so
-        //     dragging here changes the size for whichever
-        //     mode the user is in (and the next stroke they
-        //     make in the OTHER mode). The leftmost child is
-        //     a live preview circle whose diameter mirrors
-        //     the current value, so the user can see what
-        //     they're about to draw.
-        mainRow.addView(makeBrushSizeSlider())
-        mainRow.addView(makeVerticalDivider())
-        // 5. 撤销
-        mainRow.addView(makeAnnotationActionButton(R.drawable.ic_action_undo, "撤销") {
-            drawingOverlay?.undo()
-        })
-        // 6. 重做
-        mainRow.addView(makeAnnotationActionButton(R.drawable.ic_action_redo, "重做") {
-            drawingOverlay?.redo()
-        })
-        // Keep exit actions outside the scrolling tools so they remain reachable.
-        val exitActions = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        exitActions.addView(makeAnnotationActionButton(R.drawable.ic_action_save, "保存") {
-            onActionClicked(ACTION_SAVE_ANNOTATE)
-        })
-        // 8. 应用 — apply annotation, restore size/position, exit
-        exitActions.addView(makeAnnotationActionButton(R.drawable.ic_action_apply, "应用") {
-            exitAnnotationMode()
-        })
-        // 9. 取消 — discard and exit
-        exitActions.addView(makeAnnotationActionButton(R.drawable.ic_close, "取消", asCancel = true) {
-            exitAnnotationMode(discardChanges = true)
-        })
-
-        toolbar.addView(
-            HorizontalScrollView(context).apply {
-                isHorizontalScrollBarEnabled = false
-                layoutParams = LinearLayout.LayoutParams(
-                    0,
-                    dpToPx(TOOLBAR_HEIGHT_DP),
-                    1f,
-                )
-                addView(mainRow)
-            }
+    private fun buildAnnotationToolbar(overlay: DrawingOverlayView): AnnotationToolbar =
+        AnnotationToolbar(
+            context = context,
+            theme = theme,
+            drawing = overlay,
+            initialColor = selectedAnnotationColor,
+            toolbarHeightPx = dpToPx(TOOLBAR_HEIGHT_DP),
+            onColorSelected = { selectedAnnotationColor = it },
+            onSave = { onActionClicked(ACTION_SAVE_ANNOTATE) },
+            onApply = { exitAnnotationMode() },
+            onCancel = { exitAnnotationMode(discardChanges = true) },
         )
-        toolbar.addView(makeVerticalDivider())
-        toolbar.addView(exitActions)
-        // Pen and eraser switch directly; width stays on the shared slider.
-        return toolbar
-    }
 
     private fun repositionAnnotationToolbar() {
         val toolbar = annotationToolbar ?: return
@@ -1663,266 +1546,6 @@ class PinWindowView(
         }
     }
 
-
-    private fun makeBrushSizeSlider(): View {
-        val density = resources.displayMetrics.density
-        val currentWidthPx = drawingOverlay?.strokeWidth ?: 6f
-        // Live preview circle — diameter tracks the current
-        // strokeWidth so the user gets immediate visual
-        // feedback as they drag. Min 8dp so a 2dp brush is
-        // still visible on the toolbar.
-        val preview = View(context).apply {
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(theme.iconColor)
-            }
-            val px = (currentWidthPx * density).toInt()
-                .coerceAtLeast((8 * density).toInt())
-            layoutParams = LinearLayout.LayoutParams(px, px).apply {
-                gravity = Gravity.CENTER_VERTICAL
-                marginStart = (4 * density).toInt()
-                marginEnd = (4 * density).toInt()
-            }
-        }
-        // Divider between preview and slider, matching the
-        // visual rhythm of the rest of the toolbar.
-        val divider = View(context).apply {
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                setColor("#22000000".toColorInt())
-                setSize(dpToPx(1), dpToPx(20))
-            }
-            layoutParams = LinearLayout.LayoutParams(dpToPx(1), dpToPx(20)).apply {
-                gravity = Gravity.CENTER
-                marginStart = (4 * density).toInt()
-                marginEnd = (4 * density).toInt()
-            }
-        }
-        // The actual slider. Range: 2dp to 24dp (24px on a
-        // baseline 1.0 density, 48px on 2.0 — the widest
-        // brush is still well within the wrapper's imageCard
-        // bounds).
-        val slider = android.widget.SeekBar(context).apply {
-            max = 100
-            progress = ((currentWidthPx - 2f) / 22f * 100f).toInt()
-                .coerceIn(0, 100)
-            layoutParams = LinearLayout.LayoutParams(
-                (140 * density).toInt(),
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-            )
-            contentDescription = "笔刷大小"
-            // Keep the gesture inside SeekBar instead of letting the
-            // overlay wrapper classify it as a window drag.
-            setOnTouchListener { view, event ->
-                view.parent?.requestDisallowInterceptTouchEvent(true)
-                false
-            }
-            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(
-                    seekBar: android.widget.SeekBar?,
-                    progress: Int,
-                    fromUser: Boolean,
-                ) {
-                    val baseWidth = 2f + (progress / 100f) * 22f
-                    drawingOverlay?.strokeWidth = baseWidth
-                    val newPx = (baseWidth * density).toInt()
-                        .coerceAtLeast((8 * density).toInt())
-                    preview.layoutParams = preview.layoutParams.apply {
-                        width = newPx
-                        height = newPx
-                    }
-                    preview.requestLayout()
-                }
-                override fun onStartTrackingTouch(seekBar: android.widget.SeekBar?) {}
-                override fun onStopTrackingTouch(seekBar: android.widget.SeekBar?) {}
-            })
-        }
-        return LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(preview)
-            addView(divider)
-            addView(slider)
-        }
-    }
-
-        private fun makeColorSwatch(
-        color: Int,
-        label: String,
-        isSelected: Boolean = false,
-        onPick: () -> Unit,
-    ): View {
-        val density = resources.displayMetrics.density
-        val size = (28 * density).toInt()
-        // Selected swatch: keep the color fill but draw a thicker
-        // ring on the outside so the active choice is obvious
-        // against the other 7 swatches in the row.
-        val strokePx = if (isSelected) (3 * density).toInt() else (1 * density).toInt()
-        val strokeColor = if (isSelected) Color.WHITE else "#33FFFFFF".toColorInt()
-        return LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            isClickable = true
-            isFocusable = true
-            contentDescription = label
-            layoutParams = LinearLayout.LayoutParams(size, size).apply {
-                gravity = Gravity.CENTER
-                marginStart = (2 * density).toInt()
-                marginEnd = (2 * density).toInt()
-            }
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(color)
-                setStroke(strokePx, strokeColor)
-            }
-            // Own the entire touch stream so the wrapper's
-            // onTouchEvent never sees anything from this swatch.
-            // Without this, a sloppy tap that crossed the
-            // swatch boundary on the way to UP would be
-            // picked up as an in-card drag, and the wrapper
-            // would translate the imageCard in response —
-            // which is the "image shifts after tapping a
-            // color" symptom the user reported. Returning
-            // true here consumes the event; performClick()
-            // fires the OnClickListener on ACTION_UP so the
-            // color selection still goes through.
-            setOnTouchListener { v, event ->
-                if (event.actionMasked == MotionEvent.ACTION_UP) {
-                    v.performClick()
-                }
-                true
-            }
-            setOnClickListener { onPick() }
-        }
-    }
-
-    /**
-     * Switch the active annotation color. Updates the drawing
-     * overlay's stroke color (the next stroke will use it),
-     * re-tags the toolbar swatches so the active one shows the
-     * selection ring, and remembers the choice for the duration
-     * of this annotation session.
-     *
-     * Picking even the already-active color returns to the pen;
-     * only a changed color needs to refresh the swatch rings.
-     */
-    private fun selectAnnotationColor(color: Int) {
-        selectAnnotationMode(DrawingOverlayView.Mode.PEN)
-        if (selectedAnnotationColor == color) return
-        selectedAnnotationColor = color
-        drawingOverlay?.strokeColor = color
-        refreshSwatchSelection()
-    }
-
-    private fun selectAnnotationMode(mode: DrawingOverlayView.Mode) {
-        drawingOverlay?.mode = mode
-        refreshAnnotationModeSelection()
-    }
-
-    private fun refreshAnnotationModeSelection() {
-        val mode = drawingOverlay?.mode
-        annotationPenButton?.isSelected = mode == DrawingOverlayView.Mode.PEN
-        annotationEraserButton?.isSelected = mode == DrawingOverlayView.Mode.ERASER
-    }
-
-    /**
-     * Re-stamp the active-ring stroke on each of the 8 swatch
-     * views based on the current [selectedAnnotationColor]. The
-     * swatches' backgrounds are GradientDrawables, so we mutate
-     * their stroke in place — no view rebuild, no flicker. Called
-     * once after entering annotation mode (initial state) and on
-     * every [selectAnnotationColor] call.
-     */
-    private fun refreshSwatchSelection() {
-        val density = resources.displayMetrics.density
-        val palette = ANNOTATION_SWATCH_COLORS
-        for ((i, view) in swatchViews.withIndex()) {
-            val isActive = i < palette.size && palette[i] == selectedAnnotationColor
-            val strokePx = if (isActive) (3 * density).toInt() else (1 * density).toInt()
-            val strokeColor = if (isActive) Color.WHITE else "#33FFFFFF".toColorInt()
-            (view.background as? android.graphics.drawable.GradientDrawable)?.apply {
-                setStroke(strokePx, strokeColor)
-            }
-        }
-    }
-
-    private fun makeVerticalDivider(): View {
-        val density = resources.displayMetrics.density
-        return View(context).apply {
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                setColor("#22000000".toColorInt())
-                setSize(dpToPx(1), dpToPx(20))
-            }
-            layoutParams = LinearLayout.LayoutParams(dpToPx(1), dpToPx(20)).apply {
-                gravity = Gravity.CENTER
-                marginStart = (4 * density).toInt()
-                marginEnd = (4 * density).toInt()
-            }
-        }
-    }
-
-    private fun makeAnnotationActionButton(iconRes: Int, label: String, asCancel: Boolean = false, onClick: () -> Unit): View {
-        return LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            isClickable = true
-            isFocusable = true
-            contentDescription = label
-            tooltipText = label
-            layoutParams = LinearLayout.LayoutParams(dpToPx(40), dpToPx(40)).apply {
-                gravity = Gravity.CENTER
-            }
-            val idle = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.OVAL
-                // The cancel button uses a slightly red-tinted
-                // background so it reads as "destructive" at a
-                // glance, matching the M3 pattern of using red
-                // for cancel/abort affordances.
-                setColor(if (asCancel) "#1AEF5350".toColorInt() else "#00000000".toColorInt())
-            }
-            val pressed = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(if (asCancel) "#33EF5350".toColorInt() else "#1F000000".toColorInt())
-            }
-            val selected = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor("#334488FF".toColorInt())
-            }
-            background = android.graphics.drawable.StateListDrawable().apply {
-                addState(intArrayOf(android.R.attr.state_pressed), pressed)
-                addState(intArrayOf(android.R.attr.state_selected), selected)
-                addState(intArrayOf(), idle)
-            }
-            setOnTouchListener { view, event ->
-                if (event.actionMasked == MotionEvent.ACTION_DOWN ||
-                    event.actionMasked == MotionEvent.ACTION_UP ||
-                    event.actionMasked == MotionEvent.ACTION_CANCEL
-                ) {
-                    Log.d(TAG, "Annotation action $label: ${MotionEvent.actionToString(event.action)} tool=${event.getToolType(0)}")
-                }
-                // Let View handle click eligibility, cancellation and stylus input.
-                false
-            }
-            setOnClickListener {
-                Log.d(TAG, "Annotation action clicked: $label")
-                onClick()
-            }
-            addView(ImageView(context).apply {
-                setImageResource(iconRes)
-                // Cancel icon is the theme's red, to reinforce the
-                // "destructive" meaning; the other action icons
-                // follow the theme's normal icon color.
-                val tint = if (asCancel) {
-                    "#D32F2F".toColorInt()
-                } else {
-                    theme.iconColor
-                }
-                imageTintList = android.content.res.ColorStateList.valueOf(tint)
-                layoutParams = LinearLayout.LayoutParams(dpToPx(18), dpToPx(18))
-            })
-        }
-    }
 
     /** Actual screen bounds, including any window-manager inset or cutout offset. */
     fun closeButtonScreenRect(): android.graphics.Rect {
@@ -2564,29 +2187,6 @@ class PinWindowView(
         private const val CORNER_HIT_RADIUS_DP = 24f
         private const val HANDLE_RADIUS_DP = 7f
         private const val HANDLE_STROKE_DP = 2f
-
-        /**
-         * Eight fixed colors on the annotation toolbar's swatch row.
-         * The first two (red, black) are the original choices that
-         * the toolbar shipped with; the other six fill out a basic
-         * 8-color palette. The 9th slot (rainbow / palette icon)
-         * is added later as a "调色盘" entry point for custom HSV
-         * — not part of this list because it does not pick a color
-         * itself.
-         *
-         * Order matters: the toolbar renders them in array order,
-         * left to right.
-         */
-        val ANNOTATION_SWATCH_COLORS: IntArray = intArrayOf(
-            Color.RED,
-            Color.BLACK,
-            "#FF9800".toColorInt(), // orange
-            "#FFEB3B".toColorInt(), // yellow
-            "#4CAF50".toColorInt(), // green
-            "#00BCD4".toColorInt(), // cyan
-            "#2196F3".toColorInt(), // blue
-            "#9C27B0".toColorInt(), // purple
-        )
 
         // Layout measurements.
         private const val CORNER_RADIUS_DP = 16f
