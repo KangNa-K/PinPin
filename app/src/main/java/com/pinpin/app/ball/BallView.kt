@@ -338,8 +338,9 @@ class BallView @JvmOverloads constructor(
     }
 
     /**
-     * Decode [uri] into a Bitmap no larger than [reqSide] on its
-     * longest edge, with sampling to keep the heap footprint bounded.
+     * Decode [uri] with its short edge at least [reqSide] where the source
+     * allows, sampled down so the heap footprint stays bounded (see
+     * [BallGeometry.sampleSize]).
      * Returns `null` on any failure (missing provider, OOM, unsupported
      * format, ...).
      */

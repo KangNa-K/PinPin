@@ -42,20 +42,34 @@ class BallGeometryTest {
         assertEquals(0, snap(30, 300, displayWidth = 100).x)
     }
 
-    @Test fun sampleSizeHalvesUntilLongestEdgeIsAtMostTwiceTarget() {
-        // 4000 -> 2000 -> 1000 -> 500 <= 600
+    @Test fun sampleSizeKeepsShortEdgeAtLeastTarget() {
+        // 3000 / 2, 4, 8 stay >= 300 with the long edge still > 600;
+        // 3000 / 16 = 187 < 300, so halving stops at 8.
         assertEquals(8, BallGeometry.sampleSize(4000, 3000, 300))
         assertEquals(8, BallGeometry.sampleSize(3000, 4000, 300))
     }
 
-    @Test fun sampleSizeBoundaryIsInclusive() {
+    @Test fun sampleSizeStopsOnceLongEdgeIsAtMostTwiceTarget() {
         assertEquals(1, BallGeometry.sampleSize(600, 400, 300))
-        assertEquals(2, BallGeometry.sampleSize(601, 10, 300))
+        // 601 > 600 and 400 / 2 = 200 < 300: halving would starve the short edge.
+        assertEquals(1, BallGeometry.sampleSize(601, 400, 300))
+        // 1200 x 1200: 600 >= 300 and 1200 > 600 -> 2; 300 >= 300 but 600 is not > 600.
+        assertEquals(2, BallGeometry.sampleSize(1200, 1200, 300))
     }
 
-    @Test fun sampleSizeIgnoresShortEdgeOfPanoramas() {
-        // 8000 / 16 = 500 <= 588, leaving the short edge at 1000 / 16 = 62 px.
-        assertEquals(16, BallGeometry.sampleSize(8000, 1000, 294))
+    @Test fun sampleSizeKeepsPanoramaShortEdgeSharp() {
+        // Old behaviour sampled 8000 x 1000 by 16, leaving a 62 px short edge.
+        // 1000 / 4 = 250 < 294 stops at 2: 4000 x 500.
+        assertEquals(2, BallGeometry.sampleSize(8000, 1000, 294))
+        // Long screenshot: 1080 / 4 = 270 < 294 -> 2, giving 540 x 4000.
+        assertEquals(2, BallGeometry.sampleSize(1080, 8000, 294))
+    }
+
+    @Test fun sampleSizeCapsLongEdgeForExtremeImages() {
+        // Short-edge rule keeps 1, then 20000 -> 10000 -> 5000 -> 2500 <= 4096.
+        assertEquals(8, BallGeometry.sampleSize(500, 20000, 294))
+        assertEquals(1, BallGeometry.sampleSize(294, 4096, 294))
+        assertEquals(2, BallGeometry.sampleSize(294, 4097, 294))
     }
 
     private companion object {
