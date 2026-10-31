@@ -634,6 +634,9 @@ class SelectionOverlayView @JvmOverloads constructor(
         val margin = dp(12f).toInt()
         val toolbarWidth = dp(actionToolbar.childCount * 40f + 8f).toInt()
         val toolbarHeight = dp(40f).toInt()
+        // Null until attached (e.g. in tests that lay the view out by hand).
+        val safe = rootWindowInsets
+            ?.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
         val position = SelectionGeometry.toolbarPosition(
             selectionLeft = selection.left - screenLocation[0],
             selectionTop = selection.top - screenLocation[1],
@@ -644,6 +647,10 @@ class SelectionOverlayView @JvmOverloads constructor(
             margin = margin,
             windowWidth = width.takeIf { it > 0 } ?: screenWidth,
             windowHeight = height.takeIf { it > 0 } ?: screenHeight,
+            safeLeft = safe?.left ?: 0,
+            safeTop = safe?.top ?: 0,
+            safeRight = safe?.right ?: 0,
+            safeBottom = safe?.bottom ?: 0,
         )
         toolbar.width = toolbarWidth
         toolbar.height = toolbarHeight

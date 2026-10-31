@@ -95,17 +95,25 @@ internal object SelectionGeometry {
     /**
      * Places the action toolbar centred under the selection, or above it when
      * there is no room below. The selection is in window-local pixels.
+     *
+     * The overlay window extends under the system bars, so the safe* insets
+     * (system bars and display cutout) shrink the area the toolbar may use.
      */
     fun toolbarPosition(
         selectionLeft: Int, selectionTop: Int, selectionBottom: Int, selectionWidth: Int,
         toolbarWidth: Int, toolbarHeight: Int, margin: Int,
         windowWidth: Int, windowHeight: Int,
+        safeLeft: Int = 0, safeTop: Int = 0, safeRight: Int = 0, safeBottom: Int = 0,
     ): ToolbarPosition {
-        val left = (selectionLeft + selectionWidth / 2 - toolbarWidth / 2)
-            .coerceIn(margin, (windowWidth - toolbarWidth - margin).coerceAtLeast(margin))
+        val minLeft = safeLeft + margin
+        val maxLeft = (windowWidth - safeRight - margin - toolbarWidth).coerceAtLeast(minLeft)
+        val minTop = safeTop + margin
+        // No margin at the bottom edge, matching the original placement.
+        val maxTop = (windowHeight - safeBottom - toolbarHeight).coerceAtLeast(minTop)
+        val left = (selectionLeft + selectionWidth / 2 - toolbarWidth / 2).coerceIn(minLeft, maxLeft)
         val below = selectionBottom + margin
         val above = selectionTop - margin - toolbarHeight
-        val top = if (below + toolbarHeight <= windowHeight) below else above.coerceAtLeast(margin)
+        val top = if (below <= maxTop) below else above.coerceIn(minTop, maxTop)
         return ToolbarPosition(left, top)
     }
 }

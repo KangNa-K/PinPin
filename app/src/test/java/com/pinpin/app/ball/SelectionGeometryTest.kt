@@ -117,12 +117,15 @@ class SelectionGeometryTest {
     }
 
     // 500 x 800 window, 248 x 40 toolbar, 12 px margin.
-    private fun toolbar(left: Int, top: Int, bottom: Int, width: Int, windowWidth: Int = 500) =
-        SelectionGeometry.toolbarPosition(
-            selectionLeft = left, selectionTop = top, selectionBottom = bottom, selectionWidth = width,
-            toolbarWidth = 248, toolbarHeight = 40, margin = 12,
-            windowWidth = windowWidth, windowHeight = 800,
-        )
+    private fun toolbar(
+        left: Int, top: Int, bottom: Int, width: Int, windowWidth: Int = 500,
+        safeLeft: Int = 0, safeTop: Int = 0, safeRight: Int = 0, safeBottom: Int = 0,
+    ) = SelectionGeometry.toolbarPosition(
+        selectionLeft = left, selectionTop = top, selectionBottom = bottom, selectionWidth = width,
+        toolbarWidth = 248, toolbarHeight = 40, margin = 12,
+        windowWidth = windowWidth, windowHeight = 800,
+        safeLeft = safeLeft, safeTop = safeTop, safeRight = safeRight, safeBottom = safeBottom,
+    )
 
     @Test fun toolbarCentresBelowSelection() {
         // x = 100 + 200 / 2 - 248 / 2 = 76; y = 360 + 12 = 372
@@ -150,5 +153,29 @@ class SelectionGeometryTest {
         assertEquals(240, toolbar(480, 120, 360, 20).left)
         // Window narrower than the toolbar: pinned to the left margin.
         assertEquals(12, toolbar(0, 120, 360, 100, windowWidth = 200).left)
+    }
+
+    @Test fun fullHeightSelectionKeepsToolbarBelowStatusBar() {
+        // 100 px status bar: 100 + 12 = 112 instead of 12.
+        assertEquals(ToolbarPosition(76, 112), toolbar(100, 0, 800, 200, safeTop = 100))
+    }
+
+    @Test fun flippedToolbarStaysBelowStatusBar() {
+        // above = 130 - 12 - 40 = 78 would sit under a 100 px status bar.
+        assertEquals(112, toolbar(100, 130, 800, 200, safeTop = 100).top)
+    }
+
+    @Test fun toolbarFlipsAboveWhenBelowWouldEnterNavigationBar() {
+        // below = 713 fits the 800 px window but 713 + 40 > 800 - 48 = 752.
+        // above = 400 - 12 - 40 = 348.
+        assertEquals(348, toolbar(100, 400, 701, 200, safeBottom = 48).top)
+        // Just fits: 712 + 40 = 752.
+        assertEquals(712, toolbar(100, 400, 700, 200, safeBottom = 48).top)
+    }
+
+    @Test fun toolbarStaysInsideSideInsets() {
+        // 40 px left inset: 40 + 12 = 52. Right inset 40: 500 - 40 - 12 - 248 = 200.
+        assertEquals(52, toolbar(0, 120, 360, 20, safeLeft = 40).left)
+        assertEquals(200, toolbar(480, 120, 360, 20, safeRight = 40).left)
     }
 }
