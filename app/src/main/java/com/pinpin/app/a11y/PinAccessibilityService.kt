@@ -383,6 +383,8 @@ class PinAccessibilityService : AccessibilityService() {
     override fun onInterrupt() { request?.let { abortCapture(it, "interrupted") } }
     override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
 
+    fun showNotificationShade(): Boolean = performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+
     companion object {
         private const val TAG = "PinAccessibilityService"
         const val ACTION_CAPTURE_SCREENSHOT = "com.pinpin.app.a11y.CAPTURE_SCREENSHOT"

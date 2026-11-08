@@ -33,6 +33,7 @@ import com.pinpin.app.data.PinRepository
 import com.pinpin.app.data.writeLosslessPng
 import com.pinpin.app.data.withPngEncoding
 import com.pinpin.app.data.encodeLosslessPng
+import com.pinpin.app.a11y.PinAccessibilityService
 import com.pinpin.app.ui.MainActivity
 import dagger.hilt.android.AndroidEntryPoint
 import java.io.File
@@ -671,6 +672,9 @@ class PinOverlayService : Service() {
         // 4. The ball is "tappable" — tapping it restores the
         //    pin instead of just snapping back to an edge.
         ballView.onTap = { restorePin(entity.id) }
+        ballView.onSwipeDown = {
+            PinAccessibilityService.current()?.showNotificationShade() == true
+        }
         // 5. Show the pin's image inside the ball so the user
         //    can see what they're about to restore.
         val uri = runCatching {

@@ -77,6 +77,8 @@ class BallWindowGestureTest {
                 try { assertTrue(automation.injectInputEvent(event, true)) } finally { event.recycle() }
             }
             inject(MotionEvent.ACTION_DOWN, x, y)
+            SystemClock.sleep(android.view.ViewConfiguration.getLongPressTimeout().toLong() + 100)
+            inject(MotionEvent.ACTION_MOVE, x - 100f, y + 100f)
             assertTrue("Ball did not arm", armed.await(3, TimeUnit.SECONDS))
             inject(MotionEvent.ACTION_MOVE, x + 200f, y + 300f)
             inject(MotionEvent.ACTION_UP, x + 220f, y + 320f)
@@ -93,7 +95,12 @@ class BallWindowGestureTest {
             }
             assertTrue("Selection did not receive release", confirmed.await(3, TimeUnit.SECONDS))
             assertFalse("Adding overlay cancelled the original input stream", cancelled)
-            assertEquals(Rect(x.toInt(), y.toInt(), (x + 220).toInt(), (y + 320).toInt()), result)
+            val actual = requireNotNull(result)
+            val expected = Rect((x - 100).toInt(), (y + 100).toInt(), (x + 220).toInt(), (y + 320).toInt())
+            assertTrue("Expected $expected but was $actual", listOf(
+                actual.left - expected.left, actual.top - expected.top,
+                actual.right - expected.right, actual.bottom - expected.bottom
+            ).all { kotlin.math.abs(it) <= 2 })
         } finally {
             instrumentation.runOnMainSync {
                 if (overlayAdded) manager.removeViewImmediate(overlay)

@@ -299,6 +299,9 @@ class BallService : Service() {
             Log.d(TAG, "ball tapped — launching host app")
             if (carryController?.hasImage == true) carryController?.showActions() else openHostApp()
         }
+        ballView.onSwipeDown = {
+            PinAccessibilityService.current()?.showNotificationShade() == true
+        }
         runCatching { windowManager.addView(ballView, lp) }
             .onSuccess {
                 ballAttached = true

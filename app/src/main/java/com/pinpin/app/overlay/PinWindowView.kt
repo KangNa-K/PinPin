@@ -75,8 +75,8 @@ import java.util.Locale
  *    drag resize, aspect-locked via diagonal-driven uniform scale.
  *    See [applyCornerDrag].
  *  - **Tap on the image body** (not a corner, not a button):
- *    short tap (<[TAP_THRESHOLD_MS]) toggles [toolbarShown]; long
- *    press / drag (movement > slop) starts a body drag.
+ *    short tap (<[TAP_THRESHOLD_MS]) toggles [toolbarShown]; a long
+ *    press picks a color, while movement before that drags the pin.
  *  - **Tap on the close button**: fires [onCloseClicked] (host
  *    deletes the pin).
  *  - **Tap on a toolbar button**: fires [onActionClicked] with the
@@ -228,6 +228,59 @@ class PinWindowView(
     private var downTimeMs: Long = 0L
     private var downLocalX: Float = 0f
     private var downLocalY: Float = 0f
+    private var colorPicker: PinColorPicker? = null
+    private var pickingColor = false
+    private val startColorPicker = Runnable {
+        if (interacting && !dragged && cornerDragIndex == NO_CORNER_DRAG && !annotationMode && !passthrough) {
+            val uri = (spec.annotatedImageUri ?: spec.imageUri)?.let { runCatching { it.toUri() }.getOrNull() }
+            if (uri != null && sourceBitmap != null && imagePoint(downLocalX, downLocalY) != null) {
+                closeColorPicker()
+                pickingColor = true
+                runCatching {
+                    PinColorPicker(context, scope, uri)
+                }.onSuccess {
+                    colorPicker = it
+                    updatePickedColor(downLocalX, downLocalY)
+                }.onFailure {
+                    pickingColor = false
+                    android.widget.Toast.makeText(context, "无法打开取色面板", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    private fun closeColorPicker() {
+        removeCallbacks(startColorPicker)
+        colorPicker?.close()
+        colorPicker = null
+        pickingColor = false
+    }
+
+    private fun imagePoint(x: Float, y: Float): FloatArray? {
+        val drawable = imageView.drawable ?: return null
+        val inverse = Matrix()
+        if (!imageView.imageMatrix.invert(inverse)) return null
+        val point = floatArrayOf(x - imageCard.left - imageView.left, y - imageCard.top - imageView.top)
+        inverse.mapPoints(point)
+        val width = drawable.intrinsicWidth
+        val height = drawable.intrinsicHeight
+        if (width <= 0 || height <= 0 || point[0] < 0 || point[1] < 0 || point[0] >= width || point[1] >= height) return null
+        return floatArrayOf(point[0] / width, point[1] / height)
+    }
+
+    private fun updatePickedColor(x: Float, y: Float) {
+        val picker = colorPicker ?: return
+        val point = imagePoint(x, y)
+        if (point == null) {
+            picker.hideMagnifier()
+            return
+        }
+        picker.update(point[0], point[1])
+        val location = IntArray(2)
+        getLocationOnScreen(location)
+        picker.showMagnifier(imageView, x - imageCard.left - imageView.left,
+            y - imageCard.top - imageView.top, location[0] + x, location[1] + y)
+    }
 
     // ----------------------------------------------------------------
     // Corner-drag state — see [applyCornerDrag] for the geometry.
@@ -587,12 +640,14 @@ class PinWindowView(
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
+        closeColorPicker()
         scope.cancel()
         sourceBitmap = null
         imageView.setImageDrawable(null)
     }
 
     internal fun loadImage(uriString: String) {
+        closeColorPicker()
         imageLoadJob?.cancel()
         sourceBitmap = null
         val load = scope.launch {
@@ -925,6 +980,7 @@ class PinWindowView(
 
     /** Apply the image transform; the persisted bounds are synced separately by [applySnapshot]. */
     fun applyRotation(rotation: Int) {
+        closeColorPicker()
         val deg = ((rotation % 360) + 360) % 360
         currentRotation = deg
         spec.rotation = deg
@@ -961,6 +1017,7 @@ class PinWindowView(
      * is unchanged.
      */
     fun applyFlip(flipped: Boolean) {
+        closeColorPicker()
         spec.flipped = flipped
         applyCurrentRotation()
     }
@@ -984,6 +1041,7 @@ class PinWindowView(
     private var passthrough: Boolean = false
 
     fun setPassthrough(enabled: Boolean) {
+        if (enabled) closeColorPicker()
         if (passthrough == enabled) return
         passthrough = enabled
         // The service adds a separate, touchable exit button because this
@@ -1176,6 +1234,7 @@ class PinWindowView(
      */
     fun applyTheme() {
         theme = PinTheme.of(context)
+        colorPicker?.applyTheme()
 
         // Image controls share the toolbar's theme tokens.
         (imageActionButtons + closeButton).forEach { button ->
@@ -1249,6 +1308,7 @@ class PinWindowView(
      */
     fun enterAnnotationMode(drawingMode: DrawingOverlayView.Mode = DrawingOverlayView.Mode.PEN) {
         if (annotationMode) return
+        closeColorPicker()
         if (annotationSaving || annotationRenderJob?.isActive == true || AnnotationSaveState.isSaving(pinId)) {
             android.widget.Toast.makeText(context, "上一份标注正在保存", android.widget.Toast.LENGTH_SHORT).show()
             return
@@ -1755,6 +1815,8 @@ class PinWindowView(
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                removeCallbacks(startColorPicker)
+                pickingColor = false
                 interacting = false
                 cornerDragIndex = NO_CORNER_DRAG
                 dragged = false
@@ -1806,10 +1868,19 @@ class PinWindowView(
                     downLocalY = event.y
                     downTimeMs = event.eventTime
                     dragged = false
+                    postDelayed(startColorPicker, android.view.ViewConfiguration.getLongPressTimeout().toLong())
                 }
             }
             MotionEvent.ACTION_MOVE -> {
                 if (!interacting) return false
+                if (pickingColor) {
+                    updatePickedColor(event.x, event.y)
+                    return true
+                }
+                if (PinWindowGeometry.bodyDragStarted(
+                        (event.rawX - downRawX).toInt(), (event.rawY - downRawY).toInt(),
+                        ViewConfiguration_getScaledTouchSlop(),
+                    )) removeCallbacks(startColorPicker)
                 if (cornerDragIndex >= 0) {
                     if (!cornerMoved && PinWindowGeometry.cornerDragStarted(
                             event.rawX - cornerDragDownFingerX,
@@ -1844,6 +1915,8 @@ class PinWindowView(
             }
             MotionEvent.ACTION_CANCEL -> {
                 if (!interacting) return false
+                removeCallbacks(startColorPicker)
+                if (pickingColor) closeColorPicker()
                 cornerDragIndex = NO_CORNER_DRAG
                 interacting = false
                 dragged = false
@@ -1871,12 +1944,17 @@ class PinWindowView(
             }
             MotionEvent.ACTION_UP -> {
                 if (!interacting) return false
+                removeCallbacks(startColorPicker)
+                val wasPickingColor = pickingColor
+                if (wasPickingColor) updatePickedColor(event.x, event.y)
+                if (wasPickingColor) colorPicker?.hideMagnifier()
+                pickingColor = false
                 val changed = currentX != downLayoutX || currentY != downLayoutY ||
                     currentW != gestureStartW || currentH != gestureStartH
                 if (cornerDragIndex >= 0) {
                     cornerDragIndex = NO_CORNER_DRAG
                     invalidate()
-                } else if (!dragged) {
+                } else if (!dragged && !wasPickingColor) {
                     // The user pressed and released without moving past
                     // touch slop. Classify by duration: a short tap
                     // toggles toolbar; a long press is ignored (no

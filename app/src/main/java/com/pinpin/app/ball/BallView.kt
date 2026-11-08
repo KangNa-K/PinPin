@@ -21,8 +21,10 @@ import android.util.AttributeSet
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
@@ -44,7 +46,7 @@ import kotlinx.coroutines.withContext
  * State machine:
  *  - [State.IDLE]      — at rest on a screen edge, half-hidden if user
  *                        has toggled auto-hide.
- *  - [State.DRAGGING]  — finger is down on the ball, moving it.
+ *  - [State.DRAGGING]  — finger is down; a long press unlocks moving the ball.
  *  - [State.ARMED]     — finger is still down but has *stopped* for
  *                        [ARM_DELAY_MS] over an arbitrary point on the
  *                        screen. We notify the host service, which will
@@ -119,6 +121,8 @@ class BallView @JvmOverloads constructor(
      * back so the ball can be repositioned as usual.
      */
     var onTap: (() -> Unit)? = null
+    /** Returns true when the swipe was handled by a system action. */
+    var onSwipeDown: (() -> Boolean)? = null
     var onCarryDrag: ((View) -> Boolean)? = null
     var carryingImage: Boolean = false
     var moveOnly: Boolean = false
@@ -391,6 +395,15 @@ class BallView @JvmOverloads constructor(
     // endregion
 
     private val handler = Handler(Looper.getMainLooper())
+    private var dragUnlocked = false
+    private var holdEligible = false
+    private val unlockDragRunnable = Runnable {
+        if (state == State.DRAGGING && holdEligible) {
+            dragUnlocked = true
+            holdEligible = false
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        }
+    }
     private val armRunnable: Runnable = Runnable {
         if (state == State.DRAGGING) {
             if (armTracker.remainingMs(SystemClock.uptimeMillis()) > 0) {
@@ -442,7 +455,11 @@ class BallView @JvmOverloads constructor(
     private var dragStartRawY = 0f
     private var dragStartParamX = 0
     private var dragStartParamY = 0
+    private var dragStartEventTime = 0L
     private var hasDragged: Boolean = false
+    private var notificationSwipeActive = false
+    private var notificationSwipeAttempted = false
+    private var notificationSwipePending = false
 
     private var attachEdge: Int = EDGE_RIGHT  // which screen edge we're stuck to
 
@@ -636,17 +653,32 @@ class BallView @JvmOverloads constructor(
             return true
         }
         if (ignoreUntilNextDown) return true
+        if (notificationSwipeActive) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> notificationSwipeActive = false
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    notificationSwipeAttempted = false
+                    notificationSwipeActive = false
+                    notificationSwipePending = false
+                    return true
+                }
+                else -> return true
+            }
+        }
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) notificationSwipeAttempted = false
         // Selection/capture owns the stream even when replacing an existing image.
         if (carryingImage && !moveOnly && state != State.ARMED && state != State.SELECTING)
             return handleCarriedTouch(event)
         if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
             ignoreUntilNextDown = true
+            notificationSwipePending = false
             pendingSelectRect = null
             host?.onCancel()
             resetToIdle()
             return true
         }
         if (event.actionMasked == MotionEvent.ACTION_CANCEL) {
+            notificationSwipePending = false
             handler.removeCallbacks(armRunnable)
             armTracker.cancel()
             pendingSelectRect = null
@@ -680,9 +712,14 @@ class BallView @JvmOverloads constructor(
                 Log.d(TAG, "ACTION_DOWN at raw=(${event.rawX}, ${event.rawY}) isEnabled=$isEnabled clickable=$isClickable")
                 dragStartRawX = event.rawX
                 dragStartRawY = event.rawY
+                dragStartEventTime = event.eventTime
+                notificationSwipeAttempted = false
+                notificationSwipePending = false
                 dragStartParamX = lp.x
                 dragStartParamY = lp.y
                 hasDragged = false
+                dragUnlocked = false
+                holdEligible = true
                 // armX/armY hold the "where did the user actually
                 // stop" coordinates. We seed them at DOWN so the
                 // arm timer has a sensible fallback if the user
@@ -690,22 +727,44 @@ class BallView @JvmOverloads constructor(
                 // branch updates them in real time.
                 armX = event.rawX
                 armY = event.rawY
-                armTracker.start(armX, armY, SystemClock.uptimeMillis())
                 state = State.DRAGGING
-                // Every movement outside the jitter tolerance renews this deadline.
-                if (!moveOnly) restartArmTimer()
+                handler.removeCallbacks(unlockDragRunnable)
+                handler.postDelayed(unlockDragRunnable, ViewConfiguration.getLongPressTimeout().toLong())
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
+                if (!dragUnlocked) {
+                    if (tryStartNotificationSwipe(event, lp)) return true
+                    if (kotlin.math.hypot(event.rawX - dragStartRawX, event.rawY - dragStartRawY) >
+                        ViewConfiguration.get(context).scaledTouchSlop
+                    ) {
+                        holdEligible = false
+                        hasDragged = true
+                        handler.removeCallbacks(unlockDragRunnable)
+                    }
+                    return true
+                }
                 val rawX = event.rawX
                 val rawY = event.rawY
+                val wasDragged = hasDragged
                 moveBallWithFinger(event, lp)
                 armX = rawX
                 armY = rawY
-                if (!moveOnly && armTracker.move(rawX, rawY, SystemClock.uptimeMillis())) restartArmTimer()
+                if (!moveOnly && hasDragged) {
+                    if (!wasDragged) {
+                        armTracker.start(rawX, rawY, SystemClock.uptimeMillis())
+                        restartArmTimer()
+                    } else if (armTracker.move(rawX, rawY, SystemClock.uptimeMillis())) {
+                        restartArmTimer()
+                    }
+                }
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (!dragUnlocked && event.actionMasked == MotionEvent.ACTION_UP &&
+                    tryStartNotificationSwipe(event, lp)) return true
+                notificationSwipePending = false
+                handler.removeCallbacks(unlockDragRunnable)
                 handler.removeCallbacks(armRunnable)
                 armTracker.cancel()
                 when (state) {
@@ -717,7 +776,7 @@ class BallView @JvmOverloads constructor(
                         //      (minimized-pin flow), fire it.
                         //   2. The ball was dragged: snap back to
                         //      the edge as before.
-                        if (!hasDragged) {
+                        if (!hasDragged && !dragUnlocked) {
                             val tap = onTap
                             if (tap != null) {
                                 Log.d(TAG, "ACTION_UP from DRAGGING: tap on ball — firing onTap")
@@ -733,8 +792,7 @@ class BallView @JvmOverloads constructor(
                                 return true
                             }
                         }
-                        Log.d(TAG, "ACTION_UP from DRAGGING: snap back")
-                        snapToEdge(lp)
+                        if (dragUnlocked && hasDragged) snapToEdge(lp)
                         moveOnly = false
                     }
                     State.ARMED -> {
@@ -778,6 +836,11 @@ class BallView @JvmOverloads constructor(
                 snapAnimator?.cancel()
                 dragStartRawX = event.rawX
                 dragStartRawY = event.rawY
+                dragStartEventTime = event.eventTime
+                notificationSwipeAttempted = false
+                notificationSwipePending = false
+                dragStartParamX = attachedParams?.x ?: 0
+                dragStartParamY = attachedParams?.y ?: 0
                 carryDragAttempted = false
                 suppressCarryTap = false
                 armX = event.rawX
@@ -787,6 +850,19 @@ class BallView @JvmOverloads constructor(
                 restartArmTimer()
             }
             MotionEvent.ACTION_MOVE -> {
+                if (tryStartNotificationSwipe(event, attachedParams ?: return true)) return true
+                if (shouldDeferNotificationSwipe(event)) {
+                    notificationSwipePending = true
+                    if (kotlin.math.hypot(
+                            event.rawX - dragStartRawX,
+                            event.rawY - dragStartRawY,
+                        ) > android.view.ViewConfiguration.get(context).scaledTouchSlop
+                    ) {
+                        suppressCarryTap = true
+                    }
+                    return true
+                }
+                notificationSwipePending = false
                 val slop = android.view.ViewConfiguration.get(context).scaledTouchSlop
                 if (!carryDragAttempted && kotlin.math.hypot(event.rawX - dragStartRawX, event.rawY - dragStartRawY) > slop) {
                     carryDragAttempted = true
@@ -797,12 +873,15 @@ class BallView @JvmOverloads constructor(
                 }
             }
             MotionEvent.ACTION_UP -> {
+                if (tryStartNotificationSwipe(event, attachedParams ?: return true)) return true
+                notificationSwipePending = false
                 handler.removeCallbacks(armRunnable)
                 armTracker.cancel()
                 state = State.IDLE
                 if (!carryDragAttempted && !suppressCarryTap) onTap?.invoke()
             }
             MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> {
+                notificationSwipePending = false
                 handler.removeCallbacks(armRunnable)
                 armTracker.cancel()
                 state = State.IDLE
@@ -810,6 +889,52 @@ class BallView @JvmOverloads constructor(
             }
         }
         return true
+    }
+
+    private fun tryStartNotificationSwipe(
+        event: MotionEvent,
+        lp: WindowManager.LayoutParams,
+    ): Boolean {
+        if (onSwipeDown == null || notificationSwipeAttempted ||
+            (event.actionMasked != MotionEvent.ACTION_MOVE && event.actionMasked != MotionEvent.ACTION_UP)
+        ) return false
+        val dx = event.rawX - dragStartRawX
+        val dy = event.rawY - dragStartRawY
+        val elapsed = event.eventTime - dragStartEventTime
+        if (dy < dp(NOTIFICATION_SWIPE_DISTANCE_DP) ||
+            kotlin.math.abs(dx) > dy * NOTIFICATION_SWIPE_DIRECTION_RATIO ||
+            elapsed !in 0..NOTIFICATION_SWIPE_MAX_DURATION_MS
+        ) return false
+        notificationSwipeAttempted = true
+        if (onSwipeDown?.invoke() != true) return false
+
+        notificationSwipeActive = true
+        notificationSwipePending = false
+        handler.removeCallbacks(unlockDragRunnable)
+        handler.removeCallbacks(armRunnable)
+        armTracker.cancel()
+        pendingSelectRect = null
+        carryDragAttempted = true
+        suppressCarryTap = true
+        hasDragged = true
+        state = State.IDLE
+        if (lp.x != dragStartParamX || lp.y != dragStartParamY) {
+            lp.x = dragStartParamX
+            lp.y = dragStartParamY
+            runCatching { windowManager.updateViewLayout(this, lp) }
+        }
+        invalidate()
+        return true
+    }
+
+    private fun shouldDeferNotificationSwipe(event: MotionEvent): Boolean {
+        if (onSwipeDown == null || notificationSwipeAttempted || event.actionMasked != MotionEvent.ACTION_MOVE) return false
+        val dx = event.rawX - dragStartRawX
+        val dy = event.rawY - dragStartRawY
+        val elapsed = event.eventTime - dragStartEventTime
+        return dy > 0f &&
+            kotlin.math.abs(dx) <= dy * NOTIFICATION_SWIPE_DIRECTION_RATIO &&
+            elapsed in 0..NOTIFICATION_SWIPE_MAX_DURATION_MS
     }
 
     internal var pendingSelectRect: android.graphics.Rect? = null
@@ -830,6 +955,9 @@ class BallView @JvmOverloads constructor(
     }
 
     fun resetToIdle(park: Boolean = true) {
+        handler.removeCallbacks(unlockDragRunnable)
+        holdEligible = false
+        dragUnlocked = false
         captureGestureActive = false
         continuousCarryGesture = false
         handler.removeCallbacks(armRunnable)
@@ -854,6 +982,7 @@ class BallView @JvmOverloads constructor(
         carriedBitmap?.recycle()
         carriedBitmap = null
         snapAnimator?.cancel()
+        handler.removeCallbacks(unlockDragRunnable)
         handler.removeCallbacks(armRunnable)
         armTracker.cancel()
         // Cancel any pending image decode and recycle the bitmap we
@@ -950,6 +1079,9 @@ class BallView @JvmOverloads constructor(
         // Minimum movement (in dp) to count as a real drag.
         // Anything below this is treated as touch sensor jitter.
         private const val ARM_MOVE_THRESHOLD_DP = 12f
+        private const val NOTIFICATION_SWIPE_DISTANCE_DP = 24f
+        private const val NOTIFICATION_SWIPE_DIRECTION_RATIO = 0.75f
+        private const val NOTIFICATION_SWIPE_MAX_DURATION_MS = 500L
         const val EDGE_LEFT = 0
         const val EDGE_RIGHT = 1
     }
