@@ -87,23 +87,31 @@ class BallNotificationGestureTest {
         }
     }
 
-    @Test fun movementWithoutLongPressDoesNotReposition() {
+    @Test fun movementPastTouchSlopStartsDragBeforeLongPress() {
+        lateinit var view: BallView
+        val armed = java.util.concurrent.CountDownLatch(1)
         instrumentation.runOnMainSync {
-            val view = BallView(instrumentation.targetContext)
+            view = BallView(instrumentation.targetContext)
             val params = WindowManager.LayoutParams().apply { x = 100; y = 240 }
             view.attachedParams = params
-            var shadeRequests = 0
-            view.onSwipeDown = { shadeRequests++; true }
-            val swipeDistance = 80f * view.resources.displayMetrics.density
+            val density = view.resources.displayMetrics.density
+            val distance = 40f * density
+            view.setHost(object : BallView.Host {
+                override fun onArm(originX: Int, originY: Int) { armed.countDown() }
+                override fun onSelectDone(rectInScreen: android.graphics.Rect) = Unit
+                override fun onCancel() = Unit
+            })
             val downTime = SystemClock.uptimeMillis()
 
             touch(view, downTime, downTime, MotionEvent.ACTION_DOWN, 20f, 20f)
-            touch(view, downTime, downTime + 700, MotionEvent.ACTION_MOVE, 20f, 20f + swipeDistance)
-
-            assertEquals(0, shadeRequests)
+            touch(view, downTime, downTime + 100, MotionEvent.ACTION_MOVE, 20f + distance, 20f)
+            assertEquals(100 + distance.toInt(), params.x)
             assertEquals(240, params.y)
-            touch(view, downTime, downTime + 710, MotionEvent.ACTION_CANCEL, 20f, 20f + swipeDistance)
-            view.resetToIdle(park = false)
+        }
+        try {
+            assertTrue("Stationary drag did not arm selection", armed.await(2, java.util.concurrent.TimeUnit.SECONDS))
+        } finally {
+            instrumentation.runOnMainSync { view.resetToIdle(park = false) }
         }
     }
 

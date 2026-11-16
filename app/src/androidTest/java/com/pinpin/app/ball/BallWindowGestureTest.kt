@@ -15,7 +15,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class BallWindowGestureTest {
-    @Test fun transparentBallKeepsGestureWhileOverlayIsAdded() {
+    @Test fun earlyDragCanPauseAndContinueSelectionAfterOverlayIsAdded() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
         val automation = instrumentation.uiAutomation
@@ -77,8 +77,8 @@ class BallWindowGestureTest {
                 try { assertTrue(automation.injectInputEvent(event, true)) } finally { event.recycle() }
             }
             inject(MotionEvent.ACTION_DOWN, x, y)
-            SystemClock.sleep(android.view.ViewConfiguration.getLongPressTimeout().toLong() + 100)
             inject(MotionEvent.ACTION_MOVE, x - 100f, y + 100f)
+            SystemClock.sleep(600)
             assertTrue("Ball did not arm", armed.await(3, TimeUnit.SECONDS))
             inject(MotionEvent.ACTION_MOVE, x + 200f, y + 300f)
             inject(MotionEvent.ACTION_UP, x + 220f, y + 320f)

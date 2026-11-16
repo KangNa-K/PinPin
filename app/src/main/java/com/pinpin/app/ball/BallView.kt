@@ -46,7 +46,8 @@ import kotlinx.coroutines.withContext
  * State machine:
  *  - [State.IDLE]      — at rest on a screen edge, half-hidden if user
  *                        has toggled auto-hide.
- *  - [State.DRAGGING]  — finger is down; a long press unlocks moving the ball.
+ *  - [State.DRAGGING]  — finger is down; movement past touch slop or a long
+ *                        press unlocks moving the ball.
  *  - [State.ARMED]     — finger is still down but has *stopped* for
  *                        [ARM_DELAY_MS] over an arbitrary point on the
  *                        screen. We notify the host service, which will
@@ -735,14 +736,19 @@ class BallView @JvmOverloads constructor(
             MotionEvent.ACTION_MOVE -> {
                 if (!dragUnlocked) {
                     if (tryStartNotificationSwipe(event, lp)) return true
-                    if (kotlin.math.hypot(event.rawX - dragStartRawX, event.rawY - dragStartRawY) >
-                        ViewConfiguration.get(context).scaledTouchSlop
-                    ) {
-                        holdEligible = false
-                        hasDragged = true
-                        handler.removeCallbacks(unlockDragRunnable)
+                    if (notificationSwipeAttempted || shouldDeferNotificationSwipe(event)) {
+                        notificationSwipePending = true
+                        return true
                     }
-                    return true
+                    if (kotlin.math.hypot(event.rawX - dragStartRawX, event.rawY - dragStartRawY) <=
+                        ViewConfiguration.get(context).scaledTouchSlop
+                    ) return true
+                    // Crossing touch slop is already a deliberate drag. Previously
+                    // this cancelled long-press eligibility but kept the ball locked,
+                    // so every later MOVE was ignored until the user lifted.
+                    handler.removeCallbacks(unlockDragRunnable)
+                    holdEligible = false
+                    dragUnlocked = true
                 }
                 val rawX = event.rawX
                 val rawY = event.rawY

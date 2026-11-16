@@ -20,8 +20,8 @@ android {
         applicationId = "com.pinpin.app"
         minSdk = 30
         targetSdk = 37
-        versionCode = 16
-        versionName = "1.1.7"
+        versionCode = 17
+        versionName = "1.1.8"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

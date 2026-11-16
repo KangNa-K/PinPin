@@ -1,8 +1,8 @@
 {
-  "versionCode": 16,
-  "versionName": "1.1.7",
-  "apkUrl": "https://api.github.com/repos/KangNa-K/PinPin-updates/releases/assets/720800201",
-  "sha256": "138d5261a38dc410240a16a2f0a22f99fa576aa66350a4c3a27919835e883f93",
+  "versionCode": 17,
+  "versionName": "1.1.8",
+  "apkUrl": "https://api.github.com/repos/KangNa-K/PinPin-updates/releases/assets/723219795",
+  "sha256": "548f0c5b6f7b586985ef0aa599b81d1d876b329f46664bdb92a718221fdc029d",
   "size": 5087925,
-  "notes": "悬浮球支持直接下滑打开通知栏，位置保持不变；长按后可拖动，拖动时停顿可进入截图选区。下滑打开通知栏需要启用钉图无障碍服务。"
+  "notes": "修复悬浮球拖动选择区域时越过触摸阈值后无法继续拖动的问题；完善悬浮球窗口手势在进入选区后的连续拖动。"
 }
