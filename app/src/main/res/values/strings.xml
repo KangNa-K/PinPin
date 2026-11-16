@@ -32,8 +32,6 @@
          banner deep-links to the a11y settings screen. -->
     <string name="a11y_status_banner_title">未启用无障碍服务</string>
     <string name="a11y_status_banner_body">点击前往 设置 → 辅助功能 → 钉图，启用后可恢复截图功能</string>
-    <string name="a11y_run_capture_failed">无障碍服务未响应。请到 设置 → 辅助功能 → 钉图，关闭再打开一次以恢复截图功能</string>
-
     <!-- Ball image adjust activity (launched after picking a new ball image) -->
     <string name="ball_adjust_title">调整悬浮球图片</string>
     <string name="ball_adjust_cancel">取消</string>

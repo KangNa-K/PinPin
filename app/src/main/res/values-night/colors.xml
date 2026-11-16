@@ -7,5 +7,4 @@
         palette in Color.kt. Light counterparts live in values/colors.xml.
     -->
     <color name="pinpin_background">#1C1C2E</color>
-    <color name="ic_launcher_background">#7768E8</color>
 </resources>
